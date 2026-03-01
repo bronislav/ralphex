@@ -1665,8 +1665,8 @@ def run_tests() -> None:
                TestDetectGitWorktree, TestExtractCredentials, TestScheduleCleanup,
                TestBuildDockerCmd, TestKeychainServiceName, TestBuildVolumesClaudeHome,
                TestExtractCredentialsClaudeHome, TestSelinuxEnabled, TestSelinuxVolumeSuffix,
-               TestClaudeConfigDirEnv, TestExtraVolumes, TestExtractExtraVolumes, TestExtraEnv,
-               TestBedrockEnv, TestAwsCredentialExport, TestBedrockSkipKeychain,
+               TestClaudeConfigDirEnv, TestExtraVolumes, TestExtractExtraVolumes, TestDetectTimezone,
+               TestExtraEnv, TestBedrockEnv, TestAwsCredentialExport, TestBedrockSkipKeychain,
                TestBedrockValidation]:
         suite.addTests(loader.loadTestsFromTestCase(tc))
     runner = unittest.TextTestRunner(verbosity=2)
