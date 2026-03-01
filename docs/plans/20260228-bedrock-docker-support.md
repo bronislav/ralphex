@@ -73,20 +73,20 @@
 **Security note:** Never mount `~/.aws` directory - it may contain sensitive data beyond credentials.
 Instead, use `aws configure export-credentials` to export only the needed credentials.
 
-- [ ] add `export_aws_profile_credentials()` function:
+- [x] add `export_aws_profile_credentials()` function:
   - check if `AWS_PROFILE` is set and explicit creds (`AWS_ACCESS_KEY_ID`) are NOT set
   - run `aws configure export-credentials --profile $AWS_PROFILE --format env`
   - parse output to extract `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`
   - return dict of exported credentials (may be empty if command fails)
   - handle command failure gracefully (return empty dict, log warning)
-- [ ] integrate into `run_docker()` - add exported creds to env args when bedrock enabled
-- [ ] write `TestAwsCredentialExport` test class with cases:
+- [x] integrate into `run_docker()` - add exported creds to env args when bedrock enabled
+- [x] write `TestAwsCredentialExport` test class with cases:
   - `test_exports_credentials_with_profile` - AWS_PROFILE set → runs aws cli, parses output
   - `test_skips_export_when_explicit_creds` - AWS_ACCESS_KEY_ID set → no aws cli call
   - `test_skips_export_when_no_profile` - AWS_PROFILE not set → no aws cli call
   - `test_handles_export_failure` - aws cli fails → empty dict, no crash
   - `test_parses_env_format_output` - correctly extracts key/secret/token from env format
-- [ ] run tests - must pass before next task
+- [x] run tests - must pass before next task
 
 ### Task 4: Skip keychain and claude_home checks for Bedrock
 

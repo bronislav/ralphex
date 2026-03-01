@@ -154,6 +154,53 @@ def build_bedrock_env_args() -> list[str]:
     return build_extra_env_args(BEDROCK_ENV_VARS)
 
 
+def export_aws_profile_credentials() -> dict[str, str]:
+    """export AWS credentials from profile using aws cli.
+
+    when AWS_PROFILE is set and explicit credentials (AWS_ACCESS_KEY_ID) are NOT set,
+    runs `aws configure export-credentials --profile $AWS_PROFILE --format env`
+    and parses output to extract AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN.
+
+    returns dict of exported credentials (may be empty if command fails or not applicable).
+    """
+    # skip if explicit credentials are already set
+    if os.environ.get("AWS_ACCESS_KEY_ID"):
+        return {}
+
+    # skip if no profile is set
+    profile = os.environ.get("AWS_PROFILE")
+    if not profile:
+        return {}
+
+    try:
+        result = subprocess.run(
+            ["aws", "configure", "export-credentials", "--profile", profile, "--format", "env"],
+            capture_output=True, text=True, check=False,
+        )
+        if result.returncode != 0:
+            print(f"warning: aws credential export failed: {result.stderr.strip()}", file=sys.stderr)
+            return {}
+
+        # parse env format output: lines like "export AWS_ACCESS_KEY_ID=AKIA..."
+        creds: dict[str, str] = {}
+        wanted = {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"}
+        for line in result.stdout.strip().split("\n"):
+            line = line.strip()
+            if not line or not line.startswith("export "):
+                continue
+            # remove "export " prefix and split on first =
+            assignment = line[7:]  # len("export ") = 7
+            if "=" not in assignment:
+                continue
+            key, val = assignment.split("=", 1)
+            if key in wanted:
+                creds[key] = val
+        return creds
+    except OSError as e:
+        print(f"warning: aws cli not available: {e}", file=sys.stderr)
+        return {}
+
+
 def detect_timezone() -> str:
     """detect host timezone for container. checks TZ env, /etc/timezone, timedatectl, defaults to UTC."""
     tz = os.environ.get("TZ", "")
@@ -589,6 +636,12 @@ def main() -> int:
         # add bedrock env args if enabled
         bedrock_env_args = build_bedrock_env_args()
         extra_env_args.extend(bedrock_env_args)
+
+        # export aws profile credentials if bedrock enabled and profile set
+        if is_bedrock_enabled():
+            exported_creds = export_aws_profile_credentials()
+            for key, val in exported_creds.items():
+                extra_env_args.extend(["-e", f"{key}={val}"])
 
         # schedule credential cleanup
         schedule_cleanup(creds_temp)
@@ -1261,6 +1314,128 @@ def run_tests() -> None:
             self._save_and_set("RALPHEX_USE_BEDROCK", None)
             self.assertFalse(is_bedrock_enabled())
 
+    class TestAwsCredentialExport(unittest.TestCase):
+        def setUp(self) -> None:
+            """save original env state."""
+            self._saved_env: dict[str, Optional[str]] = {}
+
+        def tearDown(self) -> None:
+            """restore original env state."""
+            for key, val in self._saved_env.items():
+                if val is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = val
+
+        def _save_and_set(self, key: str, value: Optional[str]) -> None:
+            """save original value and set new value (or delete if None)."""
+            if key not in self._saved_env:
+                self._saved_env[key] = os.environ.get(key)
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+        def test_exports_credentials_with_profile(self) -> None:
+            """AWS_PROFILE set runs aws cli and parses output."""
+            self._save_and_set("AWS_PROFILE", "test-profile")
+            self._save_and_set("AWS_ACCESS_KEY_ID", None)  # ensure no explicit creds
+
+            mock_output = (
+                "export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n"
+                "export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n"
+                "export AWS_SESSION_TOKEN=FwoGZX...\n"
+            )
+            mock_result = unittest.mock.Mock()
+            mock_result.returncode = 0
+            mock_result.stdout = mock_output
+            mock_result.stderr = ""
+
+            with unittest.mock.patch(f"{__name__}.subprocess.run", return_value=mock_result) as mock_run:
+                creds = export_aws_profile_credentials()
+                mock_run.assert_called_once_with(
+                    ["aws", "configure", "export-credentials", "--profile", "test-profile", "--format", "env"],
+                    capture_output=True, text=True, check=False,
+                )
+
+            self.assertEqual(creds.get("AWS_ACCESS_KEY_ID"), "AKIAIOSFODNN7EXAMPLE")
+            self.assertEqual(creds.get("AWS_SECRET_ACCESS_KEY"), "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+            self.assertEqual(creds.get("AWS_SESSION_TOKEN"), "FwoGZX...")
+
+        def test_skips_export_when_explicit_creds(self) -> None:
+            """AWS_ACCESS_KEY_ID set skips aws cli call."""
+            self._save_and_set("AWS_PROFILE", "test-profile")
+            self._save_and_set("AWS_ACCESS_KEY_ID", "AKIAEXPLICIT")
+
+            with unittest.mock.patch(f"{__name__}.subprocess.run") as mock_run:
+                creds = export_aws_profile_credentials()
+                mock_run.assert_not_called()
+
+            self.assertEqual(creds, {})
+
+        def test_skips_export_when_no_profile(self) -> None:
+            """AWS_PROFILE not set skips aws cli call."""
+            self._save_and_set("AWS_PROFILE", None)
+            self._save_and_set("AWS_ACCESS_KEY_ID", None)
+
+            with unittest.mock.patch(f"{__name__}.subprocess.run") as mock_run:
+                creds = export_aws_profile_credentials()
+                mock_run.assert_not_called()
+
+            self.assertEqual(creds, {})
+
+        def test_handles_export_failure(self) -> None:
+            """aws cli failure returns empty dict."""
+            self._save_and_set("AWS_PROFILE", "test-profile")
+            self._save_and_set("AWS_ACCESS_KEY_ID", None)
+
+            mock_result = unittest.mock.Mock()
+            mock_result.returncode = 1
+            mock_result.stdout = ""
+            mock_result.stderr = "profile not found"
+
+            with unittest.mock.patch(f"{__name__}.subprocess.run", return_value=mock_result):
+                creds = export_aws_profile_credentials()
+
+            self.assertEqual(creds, {})
+
+        def test_parses_env_format_output(self) -> None:
+            """correctly extracts key/secret/token from env format."""
+            self._save_and_set("AWS_PROFILE", "test-profile")
+            self._save_and_set("AWS_ACCESS_KEY_ID", None)
+
+            # test with extra whitespace and other env vars
+            mock_output = (
+                "  export AWS_ACCESS_KEY_ID=AKIA123  \n"
+                "export AWS_SECRET_ACCESS_KEY=secret123\n"
+                "export AWS_SESSION_TOKEN=token123\n"
+                "export SOME_OTHER_VAR=ignored\n"
+                "\n"
+            )
+            mock_result = unittest.mock.Mock()
+            mock_result.returncode = 0
+            mock_result.stdout = mock_output
+            mock_result.stderr = ""
+
+            with unittest.mock.patch(f"{__name__}.subprocess.run", return_value=mock_result):
+                creds = export_aws_profile_credentials()
+
+            self.assertEqual(len(creds), 3)
+            self.assertEqual(creds["AWS_ACCESS_KEY_ID"], "AKIA123")
+            self.assertEqual(creds["AWS_SECRET_ACCESS_KEY"], "secret123")
+            self.assertEqual(creds["AWS_SESSION_TOKEN"], "token123")
+            self.assertNotIn("SOME_OTHER_VAR", creds)
+
+        def test_handles_oserror(self) -> None:
+            """OSError (aws cli not available) returns empty dict."""
+            self._save_and_set("AWS_PROFILE", "test-profile")
+            self._save_and_set("AWS_ACCESS_KEY_ID", None)
+
+            with unittest.mock.patch(f"{__name__}.subprocess.run", side_effect=OSError("command not found")):
+                creds = export_aws_profile_credentials()
+
+            self.assertEqual(creds, {})
+
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
     for tc in [TestResolvePath, TestSymlinkTargetDirs, TestShouldBindPort, TestBuildVolumes,
@@ -1268,7 +1443,7 @@ def run_tests() -> None:
                TestBuildDockerCmd, TestKeychainServiceName, TestBuildVolumesClaudeHome,
                TestExtractCredentialsClaudeHome, TestSelinuxEnabled, TestSelinuxVolumeSuffix,
                TestClaudeConfigDirEnv, TestExtraVolumes, TestExtractExtraVolumes, TestExtraEnv,
-               TestBedrockEnv]:
+               TestBedrockEnv, TestAwsCredentialExport]:
         suite.addTests(loader.loadTestsFromTestCase(tc))
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
