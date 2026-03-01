@@ -40,15 +40,15 @@
 **Files:**
 - Modify: `scripts/ralphex-dk.sh`
 
-- [ ] add `get_extra_env_vars()` function to parse `RALPHEX_EXTRA_ENV` (comma-separated list)
-- [ ] add `build_extra_env_args()` function to convert env var names to `-e VAR=val` docker args
-- [ ] integrate into `run_docker()` to pass extra env vars to container
-- [ ] write `TestExtraEnv` test class with cases:
+- [x] add `get_extra_env_vars()` function to parse `RALPHEX_EXTRA_ENV` (comma-separated list)
+- [x] add `build_extra_env_args()` function to convert env var names to `-e VAR=val` docker args
+- [x] integrate into `run_docker()` to pass extra env vars to container
+- [x] write `TestExtraEnv` test class with cases:
   - `test_parses_comma_separated` - "VAR1,VAR2" → ["VAR1", "VAR2"]
   - `test_handles_whitespace` - " VAR1 , VAR2 " → ["VAR1", "VAR2"]
   - `test_empty_is_noop` - "" → []
   - `test_only_passes_set_vars` - VAR1 set, VAR2 not set → only VAR1 passed
-- [ ] run tests via `python3 scripts/ralphex-dk.sh --test` - must pass before next task
+- [x] run tests via `python3 scripts/ralphex-dk.sh --test` - must pass before next task
 
 ### Task 2: Add RALPHEX_USE_BEDROCK activation
 

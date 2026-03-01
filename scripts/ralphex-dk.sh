@@ -98,6 +98,24 @@ def should_bind_port(args: list[str]) -> bool:
     return "--serve" in args or "-s" in args
 
 
+def get_extra_env_vars() -> list[str]:
+    """parse RALPHEX_EXTRA_ENV comma-separated list into individual var names."""
+    raw = os.environ.get("RALPHEX_EXTRA_ENV", "")
+    if not raw.strip():
+        return []
+    return [v.strip() for v in raw.split(",") if v.strip()]
+
+
+def build_extra_env_args(var_names: list[str]) -> list[str]:
+    """convert env var names to docker -e arguments, only for vars that are set."""
+    args: list[str] = []
+    for name in var_names:
+        val = os.environ.get(name)
+        if val is not None:
+            args.extend(["-e", f"{name}={val}"])
+    return args
+
+
 def detect_timezone() -> str:
     """detect host timezone for container. checks TZ env, /etc/timezone, timedatectl, defaults to UTC."""
     tz = os.environ.get("TZ", "")
@@ -395,7 +413,8 @@ def schedule_cleanup(creds_temp: Optional[Path]) -> None:
     t.start()
 
 
-def run_docker(image: str, port: str, volumes: list[str], bind_port: bool, args: list[str]) -> int:
+def run_docker(image: str, port: str, volumes: list[str], bind_port: bool, args: list[str],
+                extra_env: Optional[list[str]] = None) -> int:
     """build and execute docker run command."""
     cmd = ["docker", "run"]
 
@@ -416,6 +435,10 @@ def run_docker(image: str, port: str, volumes: list[str], bind_port: bool, args:
         cmd.extend(["-p", f"127.0.0.1:{port}:8080"])
         if "RALPHEX_WEB_HOST" not in os.environ:
             cmd.extend(["-e", "RALPHEX_WEB_HOST=0.0.0.0"])
+
+    # add extra env vars (from RALPHEX_EXTRA_ENV)
+    if extra_env:
+        cmd.extend(extra_env)
 
     cmd.extend(volumes)
     cmd.extend(["-w", "/workspace"])
@@ -521,13 +544,17 @@ def main() -> int:
             print(f"using claude config dir: {claude_home}", file=sys.stderr)
         print(f"using image: {image}", file=sys.stderr)
 
+        # build extra env args from RALPHEX_EXTRA_ENV
+        extra_env_vars = get_extra_env_vars()
+        extra_env_args = build_extra_env_args(extra_env_vars)
+
         # schedule credential cleanup
         schedule_cleanup(creds_temp)
 
         # determine port binding
         bind_port = should_bind_port(args)
 
-        return run_docker(image, port, volumes, bind_port, args)
+        return run_docker(image, port, volumes, bind_port, args, extra_env=extra_env_args)
     finally:
         _cleanup_creds()
 
@@ -1054,13 +1081,78 @@ def run_tests() -> None:
             self.assertEqual(extra, ["-v", "/x:/y:ro"])
             self.assertEqual(remaining, ["--serve", "plan.md"])
 
+    class TestExtraEnv(unittest.TestCase):
+        def setUp(self) -> None:
+            """save original env state."""
+            self._saved_env: dict[str, Optional[str]] = {}
+
+        def tearDown(self) -> None:
+            """restore original env state."""
+            for key, val in self._saved_env.items():
+                if val is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = val
+
+        def _save_and_set(self, key: str, value: Optional[str]) -> None:
+            """save original value and set new value (or delete if None)."""
+            if key not in self._saved_env:
+                self._saved_env[key] = os.environ.get(key)
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+        def test_parses_comma_separated(self) -> None:
+            """'VAR1,VAR2' parses to ['VAR1', 'VAR2']."""
+            self._save_and_set("RALPHEX_EXTRA_ENV", "VAR1,VAR2")
+            result = get_extra_env_vars()
+            self.assertEqual(result, ["VAR1", "VAR2"])
+
+        def test_handles_whitespace(self) -> None:
+            """' VAR1 , VAR2 ' parses to ['VAR1', 'VAR2']."""
+            self._save_and_set("RALPHEX_EXTRA_ENV", " VAR1 , VAR2 ")
+            result = get_extra_env_vars()
+            self.assertEqual(result, ["VAR1", "VAR2"])
+
+        def test_empty_is_noop(self) -> None:
+            """empty RALPHEX_EXTRA_ENV returns empty list."""
+            self._save_and_set("RALPHEX_EXTRA_ENV", "")
+            result = get_extra_env_vars()
+            self.assertEqual(result, [])
+
+        def test_unset_is_noop(self) -> None:
+            """unset RALPHEX_EXTRA_ENV returns empty list."""
+            self._save_and_set("RALPHEX_EXTRA_ENV", None)
+            result = get_extra_env_vars()
+            self.assertEqual(result, [])
+
+        def test_only_passes_set_vars(self) -> None:
+            """build_extra_env_args only includes vars that are actually set."""
+            self._save_and_set("TEST_VAR1", "value1")
+            self._save_and_set("TEST_VAR2", None)  # ensure unset
+            result = build_extra_env_args(["TEST_VAR1", "TEST_VAR2"])
+            self.assertEqual(result, ["-e", "TEST_VAR1=value1"])
+
+        def test_builds_multiple_env_args(self) -> None:
+            """build_extra_env_args creates -e pairs for multiple vars."""
+            self._save_and_set("TEST_A", "a_val")
+            self._save_and_set("TEST_B", "b_val")
+            result = build_extra_env_args(["TEST_A", "TEST_B"])
+            self.assertEqual(result, ["-e", "TEST_A=a_val", "-e", "TEST_B=b_val"])
+
+        def test_empty_var_list_is_noop(self) -> None:
+            """build_extra_env_args with empty list returns empty list."""
+            result = build_extra_env_args([])
+            self.assertEqual(result, [])
+
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
     for tc in [TestResolvePath, TestSymlinkTargetDirs, TestShouldBindPort, TestBuildVolumes,
                TestDetectGitWorktree, TestExtractCredentials, TestScheduleCleanup,
                TestBuildDockerCmd, TestKeychainServiceName, TestBuildVolumesClaudeHome,
                TestExtractCredentialsClaudeHome, TestSelinuxEnabled, TestSelinuxVolumeSuffix,
-               TestClaudeConfigDirEnv, TestExtraVolumes, TestExtractExtraVolumes]:
+               TestClaudeConfigDirEnv, TestExtraVolumes, TestExtractExtraVolumes, TestExtraEnv]:
         suite.addTests(loader.loadTestsFromTestCase(tc))
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
