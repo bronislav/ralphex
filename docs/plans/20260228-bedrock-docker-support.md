@@ -122,13 +122,13 @@ Instead, use `aws configure export-credentials` to export only the needed creden
 
 ### Task 6: Verify acceptance criteria
 
-- [ ] verify RALPHEX_USE_BEDROCK=1 enables bedrock mode
-- [ ] verify credentials exported via `aws configure export-credentials` when profile set
-- [ ] verify explicit creds (AWS_ACCESS_KEY_ID) skip credential export
-- [ ] verify RALPHEX_EXTRA_ENV passes arbitrary env vars
-- [ ] verify keychain skipped in bedrock mode
-- [ ] verify backwards compatibility (normal mode unchanged)
-- [ ] run full test suite: `python3 scripts/ralphex-dk.sh --test`
+- [x] verify RALPHEX_USE_BEDROCK=1 enables bedrock mode
+- [x] verify credentials exported via `aws configure export-credentials` when profile set
+- [x] verify explicit creds (AWS_ACCESS_KEY_ID) skip credential export
+- [x] verify RALPHEX_EXTRA_ENV passes arbitrary env vars
+- [x] verify keychain skipped in bedrock mode
+- [x] verify backwards compatibility (normal mode unchanged)
+- [x] run full test suite: `python3 scripts/ralphex-dk.sh --test`
 
 ### Task 7: [Final] Update documentation
 
