@@ -297,7 +297,11 @@ Then use `ralphex` as usual - it runs in a container with Claude Code and Codex 
 - `RALPHEX_CONFIG_DIR` - Custom config directory (default: `~/.config/ralphex`). Overrides global config location for prompts, agents, and settings
 - `CLAUDE_CONFIG_DIR` - Claude config directory (default: `~/.claude`). Use for alternate Claude installations (e.g., `~/.claude2`). Works both with Docker wrapper (volume mounts and keychain derivation) and non-Docker usage (passed through to Claude Code directly). Keychain service name is derived automatically from the path.
 - `RALPHEX_EXTRA_VOLUMES` - Extra volume mounts, comma-separated (e.g., `/data:/mnt/data:ro,/models:/mnt/models`). Entries without `:` are silently skipped
+- `RALPHEX_EXTRA_ENV` - Extra environment variables to pass to container, comma-separated (e.g., `MY_VAR,OTHER_VAR`)
+- `RALPHEX_USE_BEDROCK` - Set to `1` to enable AWS Bedrock mode (skips keychain, exports AWS credentials)
 - `TZ` - Override container timezone (default: auto-detected from host via `/etc/localtime`). Example: `TZ=Europe/Berlin ralphex docs/plans/feature.md`
+
+**AWS Bedrock support:** Run with Claude models hosted on AWS Bedrock instead of the Anthropic API. See [docs/bedrock-setup.md](docs/bedrock-setup.md) for detailed setup instructions.
 
 **Extra volume mounts:**
 ```bash
