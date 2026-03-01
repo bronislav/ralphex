@@ -592,13 +592,18 @@ def main() -> int:
     else:
         claude_home = Path.home() / ".claude"
 
-    # check required directories
-    if not claude_home.is_dir():
+    # bedrock mode skips keychain and claude_home checks
+    bedrock_mode = is_bedrock_enabled()
+
+    # check required directories (skip in bedrock mode)
+    if not bedrock_mode and not claude_home.is_dir():
         print(f"error: {claude_home} directory not found (run 'claude' first to authenticate)", file=sys.stderr)
         return 1
 
-    # extract macOS credentials
-    creds_temp = extract_macos_credentials(claude_home)
+    # extract macOS credentials (skip in bedrock mode)
+    creds_temp: Optional[Path] = None
+    if not bedrock_mode:
+        creds_temp = extract_macos_credentials(claude_home)
 
     def _cleanup_creds() -> None:
         if creds_temp:
@@ -638,10 +643,15 @@ def main() -> int:
         extra_env_args.extend(bedrock_env_args)
 
         # export aws profile credentials if bedrock enabled and profile set
-        if is_bedrock_enabled():
+        exported_creds: dict[str, str] = {}
+        if bedrock_mode:
             exported_creds = export_aws_profile_credentials()
             for key, val in exported_creds.items():
                 extra_env_args.extend(["-e", f"{key}={val}"])
+
+        # print bedrock mode status
+        if bedrock_mode:
+            print("bedrock mode: enabled (keychain skipped)", file=sys.stderr)
 
         # schedule credential cleanup
         schedule_cleanup(creds_temp)
@@ -1436,6 +1446,73 @@ def run_tests() -> None:
 
             self.assertEqual(creds, {})
 
+    class TestBedrockSkipKeychain(unittest.TestCase):
+        def setUp(self) -> None:
+            """save original env state."""
+            self._saved_env: dict[str, Optional[str]] = {}
+
+        def tearDown(self) -> None:
+            """restore original env state."""
+            for key, val in self._saved_env.items():
+                if val is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = val
+
+        def _save_and_set(self, key: str, value: Optional[str]) -> None:
+            """save original value and set new value (or delete if None)."""
+            if key not in self._saved_env:
+                self._saved_env[key] = os.environ.get(key)
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+        def test_skips_credentials_extraction_when_bedrock(self) -> None:
+            """bedrock mode skips extract_macos_credentials call."""
+            self._save_and_set("RALPHEX_USE_BEDROCK", "1")
+            self._save_and_set("CLAUDE_CONFIG_DIR", None)
+
+            with unittest.mock.patch(f"{__name__}.extract_macos_credentials") as mock_extract, \
+                 unittest.mock.patch(f"{__name__}.run_docker", return_value=0), \
+                 unittest.mock.patch(f"{__name__}.build_volumes", return_value=[]), \
+                 unittest.mock.patch(f"{__name__}.export_aws_profile_credentials", return_value={}):
+                # mock sys.argv to provide minimal args
+                with unittest.mock.patch.object(sys, "argv", ["ralphex-dk.sh"]):
+                    main()
+                mock_extract.assert_not_called()
+
+        def test_skips_claude_home_check_when_bedrock(self) -> None:
+            """bedrock mode skips claude_home.is_dir() check, no error if missing."""
+            self._save_and_set("RALPHEX_USE_BEDROCK", "1")
+            # point to a non-existent directory
+            self._save_and_set("CLAUDE_CONFIG_DIR", "/nonexistent/claude/dir")
+
+            with unittest.mock.patch(f"{__name__}.run_docker", return_value=0), \
+                 unittest.mock.patch(f"{__name__}.build_volumes", return_value=[]), \
+                 unittest.mock.patch(f"{__name__}.export_aws_profile_credentials", return_value={}):
+                with unittest.mock.patch.object(sys, "argv", ["ralphex-dk.sh"]):
+                    result = main()
+            # should not return 1 (error) even though claude_home doesn't exist
+            self.assertEqual(result, 0)
+
+        def test_normal_mode_still_extracts_credentials(self) -> None:
+            """without bedrock mode, extract_macos_credentials is called."""
+            self._save_and_set("RALPHEX_USE_BEDROCK", None)
+
+            tmp = Path(tempfile.mkdtemp()).resolve()
+            try:
+                self._save_and_set("CLAUDE_CONFIG_DIR", str(tmp))
+
+                with unittest.mock.patch(f"{__name__}.extract_macos_credentials", return_value=None) as mock_extract, \
+                     unittest.mock.patch(f"{__name__}.run_docker", return_value=0), \
+                     unittest.mock.patch(f"{__name__}.build_volumes", return_value=[]):
+                    with unittest.mock.patch.object(sys, "argv", ["ralphex-dk.sh"]):
+                        main()
+                    mock_extract.assert_called_once_with(tmp)
+            finally:
+                shutil.rmtree(tmp)
+
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
     for tc in [TestResolvePath, TestSymlinkTargetDirs, TestShouldBindPort, TestBuildVolumes,
@@ -1443,7 +1520,7 @@ def run_tests() -> None:
                TestBuildDockerCmd, TestKeychainServiceName, TestBuildVolumesClaudeHome,
                TestExtractCredentialsClaudeHome, TestSelinuxEnabled, TestSelinuxVolumeSuffix,
                TestClaudeConfigDirEnv, TestExtraVolumes, TestExtractExtraVolumes, TestExtraEnv,
-               TestBedrockEnv, TestAwsCredentialExport]:
+               TestBedrockEnv, TestAwsCredentialExport, TestBedrockSkipKeychain]:
         suite.addTests(loader.loadTestsFromTestCase(tc))
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
