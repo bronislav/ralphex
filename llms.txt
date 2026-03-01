@@ -125,7 +125,20 @@ export RALPHEX_IMAGE=ghcr.io/umputun/ralphex:latest
 - `RALPHEX_CONFIG_DIR` - Custom config directory (default: `~/.config/ralphex`). Overrides global config location for prompts, agents, and settings
 - `CLAUDE_CONFIG_DIR` - Claude config directory (default: `~/.claude`). Use for alternate Claude installations (e.g., `~/.claude2`). Works with both Docker wrapper and non-Docker usage.
 - `RALPHEX_EXTRA_VOLUMES` - Extra volume mounts, comma-separated (e.g., `/data:/mnt/data:ro,/models:/mnt/models`)
+- `RALPHEX_EXTRA_ENV` - Extra environment variables to pass to container, comma-separated (e.g., `MY_VAR,OTHER_VAR`)
+- `RALPHEX_USE_BEDROCK` - Set to `1` to enable AWS Bedrock mode (skips keychain, exports AWS credentials)
 - `TZ` - Override container timezone (default: auto-detected from host)
+
+**AWS Bedrock support:** Run with Claude models hosted on AWS Bedrock instead of the Anthropic API. See `docs/bedrock-setup.md` for detailed setup instructions. Quick start:
+
+```bash
+export RALPHEX_USE_BEDROCK=1
+export CLAUDE_CODE_USE_BEDROCK=1
+export AWS_PROFILE=ralphex-bedrock
+export AWS_REGION=us-east-1
+aws sso login --profile=ralphex-bedrock
+ralphex docs/plans/feature.md
+```
 
 **Creating custom images for other languages:**
 
