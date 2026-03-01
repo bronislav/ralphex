@@ -55,15 +55,15 @@
 **Files:**
 - Modify: `scripts/ralphex-dk.sh`
 
-- [ ] add `BEDROCK_ENV_VARS` constant with list of AWS/Bedrock-related env vars to passthrough
-- [ ] add `is_bedrock_enabled()` function checking `RALPHEX_USE_BEDROCK=1`
-- [ ] add `build_bedrock_env_args()` function to pass BEDROCK_ENV_VARS when enabled
-- [ ] integrate into `run_docker()` alongside extra env vars
-- [ ] write `TestBedrockEnv` test class with cases:
+- [x] add `BEDROCK_ENV_VARS` constant with list of AWS/Bedrock-related env vars to passthrough
+- [x] add `is_bedrock_enabled()` function checking `RALPHEX_USE_BEDROCK=1`
+- [x] add `build_bedrock_env_args()` function to pass BEDROCK_ENV_VARS when enabled
+- [x] integrate into `run_docker()` alongside extra env vars
+- [x] write `TestBedrockEnv` test class with cases:
   - `test_bedrock_disabled_no_env_passed` - RALPHEX_USE_BEDROCK not set → no AWS vars
   - `test_bedrock_enabled_passes_set_vars` - only passes vars that are set
   - `test_bedrock_env_list_complete` - verify BEDROCK_ENV_VARS contains expected vars
-- [ ] run tests - must pass before next task
+- [x] run tests - must pass before next task
 
 ### Task 3: Add AWS profile credential export for Bedrock
 

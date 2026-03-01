@@ -32,6 +32,32 @@ DEFAULT_IMAGE = "ghcr.io/umputun/ralphex-go:latest"
 DEFAULT_PORT = "8080"
 SCRIPT_URL = "https://raw.githubusercontent.com/umputun/ralphex/master/scripts/ralphex-dk.sh"
 
+# AWS/Bedrock-related env vars to passthrough when bedrock mode is enabled
+BEDROCK_ENV_VARS = [
+    # core bedrock config
+    "CLAUDE_CODE_USE_BEDROCK",
+    "AWS_REGION",
+    # profile-based auth
+    "AWS_PROFILE",
+    # explicit credentials
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    # bedrock API key auth
+    "AWS_BEARER_TOKEN_BEDROCK",
+    # model configuration
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION",
+    # optional
+    "DISABLE_PROMPT_CACHING",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+]
+
 
 def selinux_enabled() -> bool:
     """check if SELinux is enabled (Linux only). Returns True when SELinux is active (enforcing or permissive)."""
@@ -114,6 +140,18 @@ def build_extra_env_args(var_names: list[str]) -> list[str]:
         if val is not None:
             args.extend(["-e", f"{name}={val}"])
     return args
+
+
+def is_bedrock_enabled() -> bool:
+    """check if bedrock mode is enabled via RALPHEX_USE_BEDROCK=1."""
+    return os.environ.get("RALPHEX_USE_BEDROCK") == "1"
+
+
+def build_bedrock_env_args() -> list[str]:
+    """build docker -e args for bedrock env vars when bedrock mode is enabled."""
+    if not is_bedrock_enabled():
+        return []
+    return build_extra_env_args(BEDROCK_ENV_VARS)
 
 
 def detect_timezone() -> str:
@@ -547,6 +585,10 @@ def main() -> int:
         # build extra env args from RALPHEX_EXTRA_ENV
         extra_env_vars = get_extra_env_vars()
         extra_env_args = build_extra_env_args(extra_env_vars)
+
+        # add bedrock env args if enabled
+        bedrock_env_args = build_bedrock_env_args()
+        extra_env_args.extend(bedrock_env_args)
 
         # schedule credential cleanup
         schedule_cleanup(creds_temp)
@@ -1146,13 +1188,87 @@ def run_tests() -> None:
             result = build_extra_env_args([])
             self.assertEqual(result, [])
 
+    class TestBedrockEnv(unittest.TestCase):
+        def setUp(self) -> None:
+            """save original env state."""
+            self._saved_env: dict[str, Optional[str]] = {}
+
+        def tearDown(self) -> None:
+            """restore original env state."""
+            for key, val in self._saved_env.items():
+                if val is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = val
+
+        def _save_and_set(self, key: str, value: Optional[str]) -> None:
+            """save original value and set new value (or delete if None)."""
+            if key not in self._saved_env:
+                self._saved_env[key] = os.environ.get(key)
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+        def test_bedrock_disabled_no_env_passed(self) -> None:
+            """RALPHEX_USE_BEDROCK not set returns empty list."""
+            self._save_and_set("RALPHEX_USE_BEDROCK", None)
+            self._save_and_set("AWS_REGION", "us-east-1")
+            result = build_bedrock_env_args()
+            self.assertEqual(result, [])
+
+        def test_bedrock_disabled_with_zero(self) -> None:
+            """RALPHEX_USE_BEDROCK=0 returns empty list."""
+            self._save_and_set("RALPHEX_USE_BEDROCK", "0")
+            self._save_and_set("AWS_REGION", "us-east-1")
+            result = build_bedrock_env_args()
+            self.assertEqual(result, [])
+
+        def test_bedrock_enabled_passes_set_vars(self) -> None:
+            """RALPHEX_USE_BEDROCK=1 passes only vars that are set."""
+            self._save_and_set("RALPHEX_USE_BEDROCK", "1")
+            self._save_and_set("AWS_REGION", "us-east-1")
+            self._save_and_set("CLAUDE_CODE_USE_BEDROCK", "1")
+            self._save_and_set("AWS_ACCESS_KEY_ID", None)  # ensure unset
+            result = build_bedrock_env_args()
+            self.assertIn("-e", result)
+            self.assertIn("AWS_REGION=us-east-1", result)
+            self.assertIn("CLAUDE_CODE_USE_BEDROCK=1", result)
+            # AWS_ACCESS_KEY_ID should not be present (not set)
+            self.assertNotIn("AWS_ACCESS_KEY_ID", " ".join(result))
+
+        def test_bedrock_env_list_complete(self) -> None:
+            """verify BEDROCK_ENV_VARS contains expected vars."""
+            expected = [
+                "CLAUDE_CODE_USE_BEDROCK",
+                "AWS_REGION",
+                "AWS_PROFILE",
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+                "AWS_SESSION_TOKEN",
+                "ANTHROPIC_MODEL",
+            ]
+            for var in expected:
+                self.assertIn(var, BEDROCK_ENV_VARS, f"{var} should be in BEDROCK_ENV_VARS")
+
+        def test_is_bedrock_enabled_true(self) -> None:
+            """is_bedrock_enabled returns True when RALPHEX_USE_BEDROCK=1."""
+            self._save_and_set("RALPHEX_USE_BEDROCK", "1")
+            self.assertTrue(is_bedrock_enabled())
+
+        def test_is_bedrock_enabled_false(self) -> None:
+            """is_bedrock_enabled returns False when not set."""
+            self._save_and_set("RALPHEX_USE_BEDROCK", None)
+            self.assertFalse(is_bedrock_enabled())
+
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
     for tc in [TestResolvePath, TestSymlinkTargetDirs, TestShouldBindPort, TestBuildVolumes,
                TestDetectGitWorktree, TestExtractCredentials, TestScheduleCleanup,
                TestBuildDockerCmd, TestKeychainServiceName, TestBuildVolumesClaudeHome,
                TestExtractCredentialsClaudeHome, TestSelinuxEnabled, TestSelinuxVolumeSuffix,
-               TestClaudeConfigDirEnv, TestExtraVolumes, TestExtractExtraVolumes, TestExtraEnv]:
+               TestClaudeConfigDirEnv, TestExtraVolumes, TestExtractExtraVolumes, TestExtraEnv,
+               TestBedrockEnv]:
         suite.addTests(loader.loadTestsFromTestCase(tc))
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
