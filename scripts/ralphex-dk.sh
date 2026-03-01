@@ -32,6 +32,9 @@ DEFAULT_IMAGE = "ghcr.io/umputun/ralphex-go:latest"
 DEFAULT_PORT = "8080"
 SCRIPT_URL = "https://raw.githubusercontent.com/umputun/ralphex/master/scripts/ralphex-dk.sh"
 
+# sensitive credentials that should be passed via --env-file (not visible in ps output)
+SENSITIVE_CRED_VARS = {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_BEARER_TOKEN_BEDROCK"}
+
 # AWS/Bedrock-related env vars to passthrough when bedrock mode is enabled
 BEDROCK_ENV_VARS = [
     # core bedrock config
@@ -148,10 +151,32 @@ def is_bedrock_enabled() -> bool:
 
 
 def build_bedrock_env_args() -> list[str]:
-    """build docker -e args for bedrock env vars when bedrock mode is enabled."""
+    """build docker -e args for non-sensitive bedrock env vars when enabled.
+
+    sensitive credentials (AWS_ACCESS_KEY_ID, etc.) are excluded and should be
+    passed via --env-file instead for security (not visible in ps output).
+    """
     if not is_bedrock_enabled():
         return []
-    return build_extra_env_args(BEDROCK_ENV_VARS)
+    # exclude sensitive vars - they go through --env-file
+    non_sensitive = [v for v in BEDROCK_ENV_VARS if v not in SENSITIVE_CRED_VARS]
+    return build_extra_env_args(non_sensitive)
+
+
+def collect_sensitive_bedrock_creds() -> dict[str, str]:
+    """collect sensitive bedrock credentials that should be passed via --env-file.
+
+    returns dict of var_name -> value for credentials that are set in environment.
+    these should be passed via docker --env-file to avoid exposure in ps output.
+    """
+    if not is_bedrock_enabled():
+        return {}
+    creds: dict[str, str] = {}
+    for var in SENSITIVE_CRED_VARS:
+        val = os.environ.get(var)
+        if val is not None:
+            creds[var] = val
+    return creds
 
 
 def validate_bedrock_config() -> list[str]:
@@ -170,11 +195,15 @@ def validate_bedrock_config() -> list[str]:
     if not os.environ.get("AWS_REGION"):
         warnings.append("AWS_REGION not set (required for Bedrock API calls)")
 
-    # check if credentials are available (profile or explicit)
+    # check if credentials are available (profile, explicit, or bearer token)
     has_profile = bool(os.environ.get("AWS_PROFILE"))
-    has_explicit_creds = bool(os.environ.get("AWS_ACCESS_KEY_ID"))
-    if not has_profile and not has_explicit_creds:
-        warnings.append("no AWS credentials found (set AWS_PROFILE or AWS_ACCESS_KEY_ID)")
+    has_access_key = bool(os.environ.get("AWS_ACCESS_KEY_ID"))
+    has_secret_key = bool(os.environ.get("AWS_SECRET_ACCESS_KEY"))
+    has_bearer_token = bool(os.environ.get("AWS_BEARER_TOKEN_BEDROCK"))
+    if not has_profile and not has_access_key and not has_bearer_token:
+        warnings.append("no AWS credentials found (set AWS_PROFILE, AWS_ACCESS_KEY_ID, or AWS_BEARER_TOKEN_BEDROCK)")
+    elif has_access_key and not has_secret_key:
+        warnings.append("AWS_ACCESS_KEY_ID set but AWS_SECRET_ACCESS_KEY missing (incomplete credentials)")
 
     return warnings
 
@@ -182,14 +211,16 @@ def validate_bedrock_config() -> list[str]:
 def export_aws_profile_credentials() -> dict[str, str]:
     """export AWS credentials from profile using aws cli.
 
-    when AWS_PROFILE is set and explicit credentials (AWS_ACCESS_KEY_ID) are NOT set,
+    when AWS_PROFILE is set and explicit credentials are NOT complete,
     runs `aws configure export-credentials --profile $AWS_PROFILE --format env`
     and parses output to extract AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN.
 
     returns dict of exported credentials (may be empty if command fails or not applicable).
     """
-    # skip if explicit credentials are already set
-    if os.environ.get("AWS_ACCESS_KEY_ID"):
+    # skip if explicit credentials are complete (both key and secret set)
+    has_access_key = bool(os.environ.get("AWS_ACCESS_KEY_ID"))
+    has_secret_key = bool(os.environ.get("AWS_SECRET_ACCESS_KEY"))
+    if has_access_key and has_secret_key:
         return {}
 
     # skip if no profile is set
@@ -525,8 +556,46 @@ def schedule_cleanup(creds_temp: Optional[Path]) -> None:
     t.start()
 
 
+def write_env_file(creds: dict[str, str], cleanup_list: Optional[list[Path]] = None) -> Optional[Path]:
+    """write credentials to a temp env file for secure docker env passing.
+
+    credentials passed via --env-file are not visible in process listings (ps),
+    unlike -e VAR=value which exposes secrets in command line args.
+
+    if cleanup_list is provided, the temp file is registered immediately after creation
+    to avoid race conditions where SIGTERM could leak the file.
+
+    returns path to temp file or None if no credentials to write.
+    """
+    if not creds:
+        return None
+    try:
+        fd, tmp_path = tempfile.mkstemp(prefix="ralphex-env-", suffix=".env")
+        path = Path(tmp_path)
+        # register for cleanup immediately after creation (before writes)
+        # to avoid race condition if SIGTERM arrives during write
+        if cleanup_list is not None:
+            cleanup_list.append(path)
+        with os.fdopen(fd, "w") as f:
+            for key, val in creds.items():
+                f.write(f"{key}={val}\n")
+        # restrict permissions to owner only
+        os.chmod(tmp_path, stat.S_IRUSR | stat.S_IWUSR)
+        return path
+    except OSError:
+        # mkstemp or chmod failed (disk full, permission denied, etc.)
+        # fd is only valid if mkstemp succeeded, so we can't reliably clean up here
+        return None
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return None
+
+
 def run_docker(image: str, port: str, volumes: list[str], bind_port: bool, args: list[str],
-                extra_env: Optional[list[str]] = None) -> int:
+                extra_env: Optional[list[str]] = None, env_file: Optional[Path] = None) -> int:
     """build and execute docker run command."""
     cmd = ["docker", "run"]
 
@@ -547,6 +616,10 @@ def run_docker(image: str, port: str, volumes: list[str], bind_port: bool, args:
         cmd.extend(["-p", f"127.0.0.1:{port}:8080"])
         if "RALPHEX_WEB_HOST" not in os.environ:
             cmd.extend(["-e", "RALPHEX_WEB_HOST=0.0.0.0"])
+
+    # add sensitive credentials via env-file (not visible in ps output)
+    if env_file:
+        cmd.extend(["--env-file", str(env_file)])
 
     # add extra env vars (from RALPHEX_EXTRA_ENV)
     if extra_env:
@@ -632,14 +705,19 @@ def main() -> int:
     if not bedrock_mode:
         creds_temp = extract_macos_credentials(claude_home)
 
-    def _cleanup_creds() -> None:
-        if creds_temp:
-            try:
-                creds_temp.unlink(missing_ok=True)
-            except OSError:
-                pass
+    # track all temp files that need cleanup on exit
+    # using a list so it can be extended after _cleanup_temps is defined
+    _temp_files: list[Optional[Path]] = [creds_temp]
 
-    # setup SIGTERM handler: terminate docker child process and clean up credentials
+    def _cleanup_temps() -> None:
+        for f in _temp_files:
+            if f:
+                try:
+                    f.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    # setup SIGTERM handler: terminate docker child process and clean up temp files
     def _term_handler(signum: int, frame: object) -> None:
         proc = getattr(run_docker, "_active_proc", None)
         if proc is not None:
@@ -647,7 +725,7 @@ def main() -> int:
                 proc.terminate()
             except ProcessLookupError:
                 pass
-        _cleanup_creds()
+        _cleanup_temps()
         sys.exit(128 + signum)
 
     signal.signal(signal.SIGTERM, _term_handler)
@@ -665,16 +743,33 @@ def main() -> int:
         extra_env_vars = get_extra_env_vars()
         extra_env_args = build_extra_env_args(extra_env_vars)
 
-        # add bedrock env args if enabled
+        # add bedrock env args if enabled (non-sensitive vars only)
         bedrock_env_args = build_bedrock_env_args()
         extra_env_args.extend(bedrock_env_args)
 
-        # export aws profile credentials if bedrock enabled and profile set
+        # collect sensitive credentials for secure passing via --env-file
+        # this avoids exposing secrets in process listings (ps output)
+        sensitive_creds: dict[str, str] = {}
         exported_creds: dict[str, str] = {}
         if bedrock_mode:
+            # collect explicit sensitive creds from environment
+            sensitive_creds = collect_sensitive_bedrock_creds()
+            # export creds from profile if no explicit creds
             exported_creds = export_aws_profile_credentials()
-            for key, val in exported_creds.items():
-                extra_env_args.extend(["-e", f"{key}={val}"])
+            # if exported creds provide key+secret without token, remove any stale env token
+            # this prevents mismatched credential sets (stale session token with new long-lived creds)
+            if (exported_creds.get("AWS_ACCESS_KEY_ID") and exported_creds.get("AWS_SECRET_ACCESS_KEY")
+                    and "AWS_SESSION_TOKEN" not in exported_creds):
+                sensitive_creds.pop("AWS_SESSION_TOKEN", None)
+            # merge exported creds into sensitive creds (exported takes precedence)
+            sensitive_creds.update(exported_creds)
+
+        # write sensitive credentials to env file (pass cleanup list for atomic registration)
+        env_file: Optional[Path] = None
+        if sensitive_creds:
+            env_file = write_env_file(sensitive_creds, cleanup_list=_temp_files)
+            if not env_file:
+                print("warning: failed to write credentials env file, docker may lack credentials", file=sys.stderr)
 
         # print bedrock mode status and validate config
         if bedrock_mode:
@@ -694,12 +789,8 @@ def main() -> int:
             # collect and report passed env vars
             passed_vars: list[str] = []
             for var in BEDROCK_ENV_VARS:
-                if os.environ.get(var):
+                if os.environ.get(var) or var in sensitive_creds:
                     passed_vars.append(var)
-            # add exported creds (may not be in env but will be passed)
-            for key in exported_creds:
-                if key not in passed_vars:
-                    passed_vars.append(key)
             if passed_vars:
                 print(f"  passing: {', '.join(passed_vars)}", file=sys.stderr)
 
@@ -707,15 +798,16 @@ def main() -> int:
             if extra_env_vars:
                 print(f"  extras: {', '.join(extra_env_vars)}", file=sys.stderr)
 
-        # schedule credential cleanup
+        # schedule credential cleanup (macOS keychain temp file and env file)
         schedule_cleanup(creds_temp)
+        schedule_cleanup(env_file)
 
         # determine port binding
         bind_port = should_bind_port(args)
 
-        return run_docker(image, port, volumes, bind_port, args, extra_env=extra_env_args)
+        return run_docker(image, port, volumes, bind_port, args, extra_env=extra_env_args, env_file=env_file)
     finally:
-        _cleanup_creds()
+        _cleanup_temps()
 
 
 # --- embedded tests ---
@@ -1342,17 +1434,19 @@ def run_tests() -> None:
             self.assertEqual(result, [])
 
         def test_bedrock_enabled_passes_set_vars(self) -> None:
-            """RALPHEX_USE_BEDROCK=1 passes only vars that are set."""
+            """RALPHEX_USE_BEDROCK=1 passes only non-sensitive vars that are set."""
             self._save_and_set("RALPHEX_USE_BEDROCK", "1")
             self._save_and_set("AWS_REGION", "us-east-1")
             self._save_and_set("CLAUDE_CODE_USE_BEDROCK", "1")
-            self._save_and_set("AWS_ACCESS_KEY_ID", None)  # ensure unset
+            self._save_and_set("AWS_ACCESS_KEY_ID", "AKIATEST")  # sensitive var
+            self._save_and_set("AWS_SECRET_ACCESS_KEY", "secret")  # sensitive var
             result = build_bedrock_env_args()
             self.assertIn("-e", result)
             self.assertIn("AWS_REGION=us-east-1", result)
             self.assertIn("CLAUDE_CODE_USE_BEDROCK=1", result)
-            # AWS_ACCESS_KEY_ID should not be present (not set)
+            # sensitive vars should NOT be in cmd line args (they go via --env-file)
             self.assertNotIn("AWS_ACCESS_KEY_ID", " ".join(result))
+            self.assertNotIn("AWS_SECRET_ACCESS_KEY", " ".join(result))
 
         def test_bedrock_env_list_complete(self) -> None:
             """verify BEDROCK_ENV_VARS contains expected vars."""
@@ -1377,6 +1471,115 @@ def run_tests() -> None:
             """is_bedrock_enabled returns False when not set."""
             self._save_and_set("RALPHEX_USE_BEDROCK", None)
             self.assertFalse(is_bedrock_enabled())
+
+    class TestSensitiveBedrockCreds(unittest.TestCase):
+        def setUp(self) -> None:
+            """save original env state."""
+            self._saved_env: dict[str, Optional[str]] = {}
+
+        def tearDown(self) -> None:
+            """restore original env state."""
+            for key, val in self._saved_env.items():
+                if val is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = val
+
+        def _save_and_set(self, key: str, value: Optional[str]) -> None:
+            """save original value and set new value (or delete if None)."""
+            if key not in self._saved_env:
+                self._saved_env[key] = os.environ.get(key)
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+        def test_collects_sensitive_vars_when_enabled(self) -> None:
+            """collects sensitive credentials when bedrock mode is enabled."""
+            self._save_and_set("RALPHEX_USE_BEDROCK", "1")
+            self._save_and_set("AWS_ACCESS_KEY_ID", "AKIATEST")
+            self._save_and_set("AWS_SECRET_ACCESS_KEY", "secret123")
+            self._save_and_set("AWS_SESSION_TOKEN", "token456")
+
+            creds = collect_sensitive_bedrock_creds()
+            self.assertEqual(creds["AWS_ACCESS_KEY_ID"], "AKIATEST")
+            self.assertEqual(creds["AWS_SECRET_ACCESS_KEY"], "secret123")
+            self.assertEqual(creds["AWS_SESSION_TOKEN"], "token456")
+
+        def test_returns_empty_when_disabled(self) -> None:
+            """returns empty dict when bedrock mode is disabled."""
+            self._save_and_set("RALPHEX_USE_BEDROCK", None)
+            self._save_and_set("AWS_ACCESS_KEY_ID", "AKIATEST")
+
+            creds = collect_sensitive_bedrock_creds()
+            self.assertEqual(creds, {})
+
+        def test_only_collects_set_vars(self) -> None:
+            """only includes credentials that are actually set."""
+            self._save_and_set("RALPHEX_USE_BEDROCK", "1")
+            self._save_and_set("AWS_ACCESS_KEY_ID", "AKIATEST")
+            self._save_and_set("AWS_SECRET_ACCESS_KEY", None)
+            self._save_and_set("AWS_SESSION_TOKEN", None)
+
+            creds = collect_sensitive_bedrock_creds()
+            self.assertEqual(creds, {"AWS_ACCESS_KEY_ID": "AKIATEST"})
+
+        def test_sensitive_cred_vars_complete(self) -> None:
+            """verify SENSITIVE_CRED_VARS contains expected vars."""
+            expected = {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_BEARER_TOKEN_BEDROCK"}
+            self.assertEqual(SENSITIVE_CRED_VARS, expected)
+
+    class TestWriteEnvFile(unittest.TestCase):
+        def test_writes_credentials_to_file(self) -> None:
+            """writes credentials in KEY=VALUE format."""
+            creds = {"AWS_ACCESS_KEY_ID": "AKIATEST", "AWS_SECRET_ACCESS_KEY": "secret123"}
+            env_file = write_env_file(creds)
+            try:
+                self.assertIsNotNone(env_file)
+                content = env_file.read_text()
+                self.assertIn("AWS_ACCESS_KEY_ID=AKIATEST", content)
+                self.assertIn("AWS_SECRET_ACCESS_KEY=secret123", content)
+            finally:
+                if env_file:
+                    env_file.unlink(missing_ok=True)
+
+        def test_returns_none_for_empty_creds(self) -> None:
+            """returns None when no credentials to write."""
+            env_file = write_env_file({})
+            self.assertIsNone(env_file)
+
+        def test_file_has_restricted_permissions(self) -> None:
+            """env file is only readable by owner."""
+            creds = {"AWS_ACCESS_KEY_ID": "AKIATEST"}
+            env_file = write_env_file(creds)
+            try:
+                self.assertIsNotNone(env_file)
+                mode = env_file.stat().st_mode
+                # check owner read/write only (0o600)
+                self.assertEqual(mode & 0o777, 0o600)
+            finally:
+                if env_file:
+                    env_file.unlink(missing_ok=True)
+
+        def test_registers_to_cleanup_list_atomically(self) -> None:
+            """file is registered to cleanup list immediately after creation."""
+            creds = {"AWS_ACCESS_KEY_ID": "AKIATEST"}
+            cleanup_list: list[Path] = []
+            env_file = write_env_file(creds, cleanup_list=cleanup_list)
+            try:
+                self.assertIsNotNone(env_file)
+                self.assertEqual(len(cleanup_list), 1)
+                self.assertEqual(cleanup_list[0], env_file)
+            finally:
+                if env_file:
+                    env_file.unlink(missing_ok=True)
+
+        def test_cleanup_list_not_modified_when_empty_creds(self) -> None:
+            """cleanup list unchanged when no credentials to write."""
+            cleanup_list: list[Path] = []
+            env_file = write_env_file({}, cleanup_list=cleanup_list)
+            self.assertIsNone(env_file)
+            self.assertEqual(len(cleanup_list), 0)
 
     class TestAwsCredentialExport(unittest.TestCase):
         def setUp(self) -> None:
@@ -1426,16 +1629,40 @@ def run_tests() -> None:
             self.assertEqual(creds.get("AWS_SECRET_ACCESS_KEY"), "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
             self.assertEqual(creds.get("AWS_SESSION_TOKEN"), "FwoGZX...")
 
-        def test_skips_export_when_explicit_creds(self) -> None:
-            """AWS_ACCESS_KEY_ID set skips aws cli call."""
+        def test_skips_export_when_complete_explicit_creds(self) -> None:
+            """both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY set skips aws cli call."""
             self._save_and_set("AWS_PROFILE", "test-profile")
             self._save_and_set("AWS_ACCESS_KEY_ID", "AKIAEXPLICIT")
+            self._save_and_set("AWS_SECRET_ACCESS_KEY", "secretexplicit")
 
             with unittest.mock.patch(f"{__name__}.subprocess.run") as mock_run:
                 creds = export_aws_profile_credentials()
                 mock_run.assert_not_called()
 
             self.assertEqual(creds, {})
+
+        def test_exports_when_incomplete_explicit_creds(self) -> None:
+            """only AWS_ACCESS_KEY_ID set (missing secret) falls back to profile export."""
+            self._save_and_set("AWS_PROFILE", "test-profile")
+            self._save_and_set("AWS_ACCESS_KEY_ID", "AKIAINCOMPLETE")
+            self._save_and_set("AWS_SECRET_ACCESS_KEY", None)
+
+            mock_output = (
+                "export AWS_ACCESS_KEY_ID=AKIAPROFILE\n"
+                "export AWS_SECRET_ACCESS_KEY=secretprofile\n"
+                "export AWS_SESSION_TOKEN=tokenprofile\n"
+            )
+            mock_result = unittest.mock.Mock()
+            mock_result.returncode = 0
+            mock_result.stdout = mock_output
+
+            with unittest.mock.patch(f"{__name__}.subprocess.run", return_value=mock_result) as mock_run:
+                creds = export_aws_profile_credentials()
+                mock_run.assert_called_once()
+
+            self.assertEqual(creds.get("AWS_ACCESS_KEY_ID"), "AKIAPROFILE")
+            self.assertEqual(creds.get("AWS_SECRET_ACCESS_KEY"), "secretprofile")
+            self.assertEqual(creds.get("AWS_SESSION_TOKEN"), "tokenprofile")
 
         def test_skips_export_when_no_profile(self) -> None:
             """AWS_PROFILE not set skips aws cli call."""
@@ -1617,11 +1844,12 @@ def run_tests() -> None:
             self.assertTrue(any("AWS_REGION" in w for w in warnings))
 
         def test_warns_no_credentials_found(self) -> None:
-            """warns when neither AWS_PROFILE nor AWS_ACCESS_KEY_ID is set."""
+            """warns when no credentials are set (profile, explicit, or bearer token)."""
             self._save_and_set("CLAUDE_CODE_USE_BEDROCK", "1")
             self._save_and_set("AWS_REGION", "us-east-1")
             self._save_and_set("AWS_PROFILE", None)
             self._save_and_set("AWS_ACCESS_KEY_ID", None)
+            self._save_and_set("AWS_BEARER_TOKEN_BEDROCK", None)
 
             warnings = validate_bedrock_config()
             self.assertTrue(any("credentials" in w for w in warnings))
@@ -1638,15 +1866,39 @@ def run_tests() -> None:
             self.assertEqual(warnings, [])
 
         def test_no_warning_with_explicit_creds(self) -> None:
-            """no credential warning when AWS_ACCESS_KEY_ID is set."""
+            """no credential warning when both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are set."""
             self._save_and_set("CLAUDE_CODE_USE_BEDROCK", "1")
             self._save_and_set("AWS_REGION", "us-east-1")
             self._save_and_set("AWS_PROFILE", None)
             self._save_and_set("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE")
+            self._save_and_set("AWS_SECRET_ACCESS_KEY", "secret123")
 
             warnings = validate_bedrock_config()
             # should have no warnings
             self.assertEqual(warnings, [])
+
+        def test_no_warning_with_bearer_token(self) -> None:
+            """no credential warning when AWS_BEARER_TOKEN_BEDROCK is set."""
+            self._save_and_set("CLAUDE_CODE_USE_BEDROCK", "1")
+            self._save_and_set("AWS_REGION", "us-east-1")
+            self._save_and_set("AWS_PROFILE", None)
+            self._save_and_set("AWS_ACCESS_KEY_ID", None)
+            self._save_and_set("AWS_BEARER_TOKEN_BEDROCK", "bearer-token-value")
+
+            warnings = validate_bedrock_config()
+            # should have no warnings
+            self.assertEqual(warnings, [])
+
+        def test_warns_partial_credentials(self) -> None:
+            """warns when AWS_ACCESS_KEY_ID is set but AWS_SECRET_ACCESS_KEY is missing."""
+            self._save_and_set("CLAUDE_CODE_USE_BEDROCK", "1")
+            self._save_and_set("AWS_REGION", "us-east-1")
+            self._save_and_set("AWS_PROFILE", None)
+            self._save_and_set("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE")
+            self._save_and_set("AWS_SECRET_ACCESS_KEY", None)
+
+            warnings = validate_bedrock_config()
+            self.assertTrue(any("incomplete" in w.lower() for w in warnings))
 
         def test_returns_multiple_warnings(self) -> None:
             """returns all applicable warnings."""
@@ -1654,10 +1906,76 @@ def run_tests() -> None:
             self._save_and_set("AWS_REGION", None)
             self._save_and_set("AWS_PROFILE", None)
             self._save_and_set("AWS_ACCESS_KEY_ID", None)
+            self._save_and_set("AWS_BEARER_TOKEN_BEDROCK", None)
 
             warnings = validate_bedrock_config()
             # should have 3 warnings: CLAUDE_CODE_USE_BEDROCK, AWS_REGION, credentials
             self.assertEqual(len(warnings), 3)
+
+    class TestCredentialMerge(unittest.TestCase):
+        """tests for credential merging logic between explicit env and profile export."""
+
+        def test_removes_stale_session_token_when_profile_has_long_lived_creds(self) -> None:
+            """stale AWS_SESSION_TOKEN is removed when profile export provides key+secret without token."""
+            # simulate: env has stale session token, profile returns long-lived creds (no token)
+            sensitive_creds = {
+                "AWS_ACCESS_KEY_ID": "AKIASTALE",
+                "AWS_SECRET_ACCESS_KEY": "stalesecret",
+                "AWS_SESSION_TOKEN": "staletoken123",
+            }
+            exported_creds = {
+                "AWS_ACCESS_KEY_ID": "AKIANEWLONGLIVED",
+                "AWS_SECRET_ACCESS_KEY": "newlonglivedsecret",
+                # no AWS_SESSION_TOKEN - these are long-lived IAM creds
+            }
+            # apply the merge logic from main()
+            if (exported_creds.get("AWS_ACCESS_KEY_ID") and exported_creds.get("AWS_SECRET_ACCESS_KEY")
+                    and "AWS_SESSION_TOKEN" not in exported_creds):
+                sensitive_creds.pop("AWS_SESSION_TOKEN", None)
+            sensitive_creds.update(exported_creds)
+
+            # verify stale token was removed and new creds are in place
+            self.assertEqual(sensitive_creds["AWS_ACCESS_KEY_ID"], "AKIANEWLONGLIVED")
+            self.assertEqual(sensitive_creds["AWS_SECRET_ACCESS_KEY"], "newlonglivedsecret")
+            self.assertNotIn("AWS_SESSION_TOKEN", sensitive_creds)
+
+        def test_preserves_session_token_when_profile_exports_token(self) -> None:
+            """AWS_SESSION_TOKEN is preserved when profile export includes it."""
+            sensitive_creds = {
+                "AWS_SESSION_TOKEN": "staletoken123",  # only token set (unusual but possible)
+            }
+            exported_creds = {
+                "AWS_ACCESS_KEY_ID": "AKIANEWSSO",
+                "AWS_SECRET_ACCESS_KEY": "newsecret",
+                "AWS_SESSION_TOKEN": "newssotoken456",
+            }
+            # apply the merge logic from main()
+            if (exported_creds.get("AWS_ACCESS_KEY_ID") and exported_creds.get("AWS_SECRET_ACCESS_KEY")
+                    and "AWS_SESSION_TOKEN" not in exported_creds):
+                sensitive_creds.pop("AWS_SESSION_TOKEN", None)
+            sensitive_creds.update(exported_creds)
+
+            # verify new token from profile export is used
+            self.assertEqual(sensitive_creds["AWS_SESSION_TOKEN"], "newssotoken456")
+
+        def test_no_removal_when_no_exported_creds(self) -> None:
+            """session token preserved when profile export returns empty."""
+            sensitive_creds = {
+                "AWS_ACCESS_KEY_ID": "AKIAEXPLICIT",
+                "AWS_SECRET_ACCESS_KEY": "explicitsecret",
+                "AWS_SESSION_TOKEN": "explicittoken",
+            }
+            exported_creds: dict[str, str] = {}
+            # apply the merge logic from main()
+            if (exported_creds.get("AWS_ACCESS_KEY_ID") and exported_creds.get("AWS_SECRET_ACCESS_KEY")
+                    and "AWS_SESSION_TOKEN" not in exported_creds):
+                sensitive_creds.pop("AWS_SESSION_TOKEN", None)
+            sensitive_creds.update(exported_creds)
+
+            # verify explicit creds unchanged
+            self.assertEqual(sensitive_creds["AWS_ACCESS_KEY_ID"], "AKIAEXPLICIT")
+            self.assertEqual(sensitive_creds["AWS_SECRET_ACCESS_KEY"], "explicitsecret")
+            self.assertEqual(sensitive_creds["AWS_SESSION_TOKEN"], "explicittoken")
 
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
@@ -1666,8 +1984,9 @@ def run_tests() -> None:
                TestBuildDockerCmd, TestKeychainServiceName, TestBuildVolumesClaudeHome,
                TestExtractCredentialsClaudeHome, TestSelinuxEnabled, TestSelinuxVolumeSuffix,
                TestClaudeConfigDirEnv, TestExtraVolumes, TestExtractExtraVolumes, TestDetectTimezone,
-               TestExtraEnv, TestBedrockEnv, TestAwsCredentialExport, TestBedrockSkipKeychain,
-               TestBedrockValidation]:
+               TestExtraEnv, TestBedrockEnv, TestSensitiveBedrockCreds, TestWriteEnvFile,
+               TestAwsCredentialExport, TestBedrockSkipKeychain, TestBedrockValidation,
+               TestCredentialMerge]:
         suite.addTests(loader.loadTestsFromTestCase(tc))
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
