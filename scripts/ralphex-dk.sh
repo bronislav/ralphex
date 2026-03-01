@@ -379,8 +379,9 @@ def build_volumes(creds_temp: Optional[Path], claude_home: Optional[Path] = None
             if target.is_dir() and target.is_relative_to(home):
                 add(target, str(target), ro=True)
 
-    # 1. claude_home (resolved) -> /mnt/claude:ro
-    add(resolve_path(claude_home), "/mnt/claude", ro=True)
+    # 1. claude_home (resolved) -> /mnt/claude:ro (skip if not exists, e.g. bedrock mode)
+    if claude_home.is_dir():
+        add(resolve_path(claude_home), "/mnt/claude", ro=True)
 
     # 2. cwd -> /workspace
     add(cwd, "/workspace")
@@ -394,8 +395,9 @@ def build_volumes(creds_temp: Optional[Path], claude_home: Optional[Path] = None
     if creds_temp:
         add(creds_temp, "/mnt/claude-credentials.json", ro=True)
 
-    # 5. symlink targets under claude_home
-    add_symlink_targets(claude_home)
+    # 5. symlink targets under claude_home (skip if not exists)
+    if claude_home.is_dir():
+        add_symlink_targets(claude_home)
 
     # 6. ~/.codex -> /mnt/codex:ro + symlink targets
     codex_dir = home / ".codex"
@@ -1540,13 +1542,22 @@ def run_tests() -> None:
             # point to a non-existent directory
             self._save_and_set("CLAUDE_CONFIG_DIR", "/nonexistent/claude/dir")
 
+            # don't mock build_volumes - verify it actually handles non-existent claude_home
             with unittest.mock.patch(f"{__name__}.run_docker", return_value=0), \
-                 unittest.mock.patch(f"{__name__}.build_volumes", return_value=[]), \
                  unittest.mock.patch(f"{__name__}.export_aws_profile_credentials", return_value={}):
                 with unittest.mock.patch.object(sys, "argv", ["ralphex-dk.sh"]):
                     result = main()
             # should not return 1 (error) even though claude_home doesn't exist
             self.assertEqual(result, 0)
+
+        def test_build_volumes_skips_nonexistent_claude_home(self) -> None:
+            """build_volumes gracefully skips mounting non-existent claude_home."""
+            nonexistent = Path("/nonexistent/claude/dir")
+            vols = build_volumes(None, nonexistent)
+            # should not include a mount for the non-existent claude_home
+            vol_str = " ".join(vols)
+            self.assertNotIn("/nonexistent/claude/dir", vol_str)
+            self.assertNotIn("/mnt/claude", vol_str)
 
         def test_normal_mode_still_extracts_credentials(self) -> None:
             """without bedrock mode, extract_macos_credentials is called."""
