@@ -107,18 +107,18 @@ Instead, use `aws configure export-credentials` to export only the needed creden
 **Files:**
 - Modify: `scripts/ralphex-dk.sh`
 
-- [ ] add `validate_bedrock_config()` function returning list of warnings
-- [ ] check: CLAUDE_CODE_USE_BEDROCK set (warn if not)
-- [ ] check: AWS_REGION set (warn if not)
-- [ ] check: AWS_PROFILE set OR AWS_ACCESS_KEY_ID set (warn if neither)
-- [ ] print bedrock status and passed env vars on startup
-- [ ] write `TestBedrockValidation` test class with cases:
+- [x] add `validate_bedrock_config()` function returning list of warnings
+- [x] check: CLAUDE_CODE_USE_BEDROCK set (warn if not)
+- [x] check: AWS_REGION set (warn if not)
+- [x] check: AWS_PROFILE set OR AWS_ACCESS_KEY_ID set (warn if neither)
+- [x] print bedrock status and passed env vars on startup
+- [x] write `TestBedrockValidation` test class with cases:
   - `test_warns_missing_claude_code_use_bedrock`
   - `test_warns_missing_aws_region`
   - `test_warns_no_credentials_found`
   - `test_no_warning_with_profile`
   - `test_no_warning_with_explicit_creds`
-- [ ] run tests - must pass before next task
+- [x] run tests - must pass before next task
 
 ### Task 6: Verify acceptance criteria
 

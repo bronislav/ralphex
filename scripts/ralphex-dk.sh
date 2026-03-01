@@ -154,6 +154,31 @@ def build_bedrock_env_args() -> list[str]:
     return build_extra_env_args(BEDROCK_ENV_VARS)
 
 
+def validate_bedrock_config() -> list[str]:
+    """validate bedrock configuration and return list of warnings.
+
+    checks for common misconfigurations that may prevent bedrock from working.
+    returns empty list if configuration looks good.
+    """
+    warnings: list[str] = []
+
+    # check if CLAUDE_CODE_USE_BEDROCK is set
+    if not os.environ.get("CLAUDE_CODE_USE_BEDROCK"):
+        warnings.append("CLAUDE_CODE_USE_BEDROCK not set (Claude Code won't use Bedrock)")
+
+    # check if AWS_REGION is set
+    if not os.environ.get("AWS_REGION"):
+        warnings.append("AWS_REGION not set (required for Bedrock API calls)")
+
+    # check if credentials are available (profile or explicit)
+    has_profile = bool(os.environ.get("AWS_PROFILE"))
+    has_explicit_creds = bool(os.environ.get("AWS_ACCESS_KEY_ID"))
+    if not has_profile and not has_explicit_creds:
+        warnings.append("no AWS credentials found (set AWS_PROFILE or AWS_ACCESS_KEY_ID)")
+
+    return warnings
+
+
 def export_aws_profile_credentials() -> dict[str, str]:
     """export AWS credentials from profile using aws cli.
 
@@ -649,9 +674,36 @@ def main() -> int:
             for key, val in exported_creds.items():
                 extra_env_args.extend(["-e", f"{key}={val}"])
 
-        # print bedrock mode status
+        # print bedrock mode status and validate config
         if bedrock_mode:
             print("bedrock mode: enabled (keychain skipped)", file=sys.stderr)
+
+            # validate and warn about missing config
+            config_warnings = validate_bedrock_config()
+            for warning in config_warnings:
+                print(f"  warning: {warning}", file=sys.stderr)
+
+            # report credential source
+            if exported_creds:
+                print(f"  exporting credentials from profile: {os.environ.get('AWS_PROFILE')}", file=sys.stderr)
+            elif os.environ.get("AWS_ACCESS_KEY_ID"):
+                print("  using explicit credentials", file=sys.stderr)
+
+            # collect and report passed env vars
+            passed_vars: list[str] = []
+            for var in BEDROCK_ENV_VARS:
+                if os.environ.get(var):
+                    passed_vars.append(var)
+            # add exported creds (may not be in env but will be passed)
+            for key in exported_creds:
+                if key not in passed_vars:
+                    passed_vars.append(key)
+            if passed_vars:
+                print(f"  passing: {', '.join(passed_vars)}", file=sys.stderr)
+
+            # report extra env vars
+            if extra_env_vars:
+                print(f"  extras: {', '.join(extra_env_vars)}", file=sys.stderr)
 
         # schedule credential cleanup
         schedule_cleanup(creds_temp)
@@ -1513,6 +1565,89 @@ def run_tests() -> None:
             finally:
                 shutil.rmtree(tmp)
 
+    class TestBedrockValidation(unittest.TestCase):
+        def setUp(self) -> None:
+            """save original env state."""
+            self._saved_env: dict[str, Optional[str]] = {}
+
+        def tearDown(self) -> None:
+            """restore original env state."""
+            for key, val in self._saved_env.items():
+                if val is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = val
+
+        def _save_and_set(self, key: str, value: Optional[str]) -> None:
+            """save original value and set new value (or delete if None)."""
+            if key not in self._saved_env:
+                self._saved_env[key] = os.environ.get(key)
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+        def test_warns_missing_claude_code_use_bedrock(self) -> None:
+            """warns when CLAUDE_CODE_USE_BEDROCK is not set."""
+            self._save_and_set("CLAUDE_CODE_USE_BEDROCK", None)
+            self._save_and_set("AWS_REGION", "us-east-1")
+            self._save_and_set("AWS_PROFILE", "test-profile")
+
+            warnings = validate_bedrock_config()
+            self.assertTrue(any("CLAUDE_CODE_USE_BEDROCK" in w for w in warnings))
+
+        def test_warns_missing_aws_region(self) -> None:
+            """warns when AWS_REGION is not set."""
+            self._save_and_set("CLAUDE_CODE_USE_BEDROCK", "1")
+            self._save_and_set("AWS_REGION", None)
+            self._save_and_set("AWS_PROFILE", "test-profile")
+
+            warnings = validate_bedrock_config()
+            self.assertTrue(any("AWS_REGION" in w for w in warnings))
+
+        def test_warns_no_credentials_found(self) -> None:
+            """warns when neither AWS_PROFILE nor AWS_ACCESS_KEY_ID is set."""
+            self._save_and_set("CLAUDE_CODE_USE_BEDROCK", "1")
+            self._save_and_set("AWS_REGION", "us-east-1")
+            self._save_and_set("AWS_PROFILE", None)
+            self._save_and_set("AWS_ACCESS_KEY_ID", None)
+
+            warnings = validate_bedrock_config()
+            self.assertTrue(any("credentials" in w for w in warnings))
+
+        def test_no_warning_with_profile(self) -> None:
+            """no credential warning when AWS_PROFILE is set."""
+            self._save_and_set("CLAUDE_CODE_USE_BEDROCK", "1")
+            self._save_and_set("AWS_REGION", "us-east-1")
+            self._save_and_set("AWS_PROFILE", "test-profile")
+            self._save_and_set("AWS_ACCESS_KEY_ID", None)
+
+            warnings = validate_bedrock_config()
+            # should have no warnings
+            self.assertEqual(warnings, [])
+
+        def test_no_warning_with_explicit_creds(self) -> None:
+            """no credential warning when AWS_ACCESS_KEY_ID is set."""
+            self._save_and_set("CLAUDE_CODE_USE_BEDROCK", "1")
+            self._save_and_set("AWS_REGION", "us-east-1")
+            self._save_and_set("AWS_PROFILE", None)
+            self._save_and_set("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE")
+
+            warnings = validate_bedrock_config()
+            # should have no warnings
+            self.assertEqual(warnings, [])
+
+        def test_returns_multiple_warnings(self) -> None:
+            """returns all applicable warnings."""
+            self._save_and_set("CLAUDE_CODE_USE_BEDROCK", None)
+            self._save_and_set("AWS_REGION", None)
+            self._save_and_set("AWS_PROFILE", None)
+            self._save_and_set("AWS_ACCESS_KEY_ID", None)
+
+            warnings = validate_bedrock_config()
+            # should have 3 warnings: CLAUDE_CODE_USE_BEDROCK, AWS_REGION, credentials
+            self.assertEqual(len(warnings), 3)
+
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
     for tc in [TestResolvePath, TestSymlinkTargetDirs, TestShouldBindPort, TestBuildVolumes,
@@ -1520,7 +1655,8 @@ def run_tests() -> None:
                TestBuildDockerCmd, TestKeychainServiceName, TestBuildVolumesClaudeHome,
                TestExtractCredentialsClaudeHome, TestSelinuxEnabled, TestSelinuxVolumeSuffix,
                TestClaudeConfigDirEnv, TestExtraVolumes, TestExtractExtraVolumes, TestExtraEnv,
-               TestBedrockEnv, TestAwsCredentialExport, TestBedrockSkipKeychain]:
+               TestBedrockEnv, TestAwsCredentialExport, TestBedrockSkipKeychain,
+               TestBedrockValidation]:
         suite.addTests(loader.loadTestsFromTestCase(tc))
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
