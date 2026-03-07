@@ -512,23 +512,23 @@ def export_aws_profile_credentials() -> dict[str, str]:
 
     returns dict with AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and optionally
     AWS_SESSION_TOKEN extracted from the profile. returns empty dict if:
-    - aws CLI is not available
-    - AWS_PROFILE is not set
     - explicit credentials (AWS_ACCESS_KEY_ID) are already set
+    - AWS_PROFILE is not set
+    - aws CLI is not available
     - aws cli command fails
     """
-    # check if aws CLI is available
-    if shutil.which("aws") is None:
-        print("warning: aws CLI not found, cannot export profile credentials", file=sys.stderr)
-        return {}
-
-    # skip if explicit credentials are already set
+    # skip if explicit credentials are already set (no need to export)
     if os.environ.get("AWS_ACCESS_KEY_ID"):
         return {}
 
     # skip if no profile is set
     profile = os.environ.get("AWS_PROFILE", "").strip()
     if not profile:
+        return {}
+
+    # check if aws CLI is available (only needed when profile is set)
+    if shutil.which("aws") is None:
+        print("warning: aws CLI not found, cannot export profile credentials", file=sys.stderr)
         return {}
 
     # run aws configure export-credentials
@@ -2361,6 +2361,22 @@ def run_tests() -> None:
             warning = captured.getvalue()
             self.assertIn("warning:", warning)
             self.assertIn("parse credentials JSON", warning)
+
+        def test_handles_oserror_from_subprocess(self) -> None:
+            """subprocess.run raises OSError → empty dict, warning logged."""
+            os.environ["AWS_PROFILE"] = "test-profile"
+
+            import io
+            captured = io.StringIO()
+            with unittest.mock.patch("sys.stderr", captured):
+                with unittest.mock.patch("subprocess.run", side_effect=OSError("cannot execute")):
+                    with unittest.mock.patch("shutil.which", return_value="/usr/bin/aws"):
+                        creds = export_aws_profile_credentials()
+
+            self.assertEqual(creds, {})
+            warning = captured.getvalue()
+            self.assertIn("warning:", warning)
+            self.assertIn("failed to run aws CLI", warning)
 
     class TestBedrockSkipKeychain(unittest.TestCase):
         """tests for bedrock mode skipping keychain and claude_home checks."""
