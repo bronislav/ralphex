@@ -507,6 +507,62 @@ def build_bedrock_env_args() -> list[str]:
     return result
 
 
+def export_aws_profile_credentials() -> dict[str, str]:
+    """export AWS credentials from profile using aws configure export-credentials.
+
+    returns dict with AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and optionally
+    AWS_SESSION_TOKEN extracted from the profile. returns empty dict if:
+    - aws CLI is not available
+    - AWS_PROFILE is not set
+    - explicit credentials (AWS_ACCESS_KEY_ID) are already set
+    - aws cli command fails
+    """
+    # check if aws CLI is available
+    if shutil.which("aws") is None:
+        print("warning: aws CLI not found, cannot export profile credentials", file=sys.stderr)
+        return {}
+
+    # skip if explicit credentials are already set
+    if os.environ.get("AWS_ACCESS_KEY_ID"):
+        return {}
+
+    # skip if no profile is set
+    profile = os.environ.get("AWS_PROFILE", "").strip()
+    if not profile:
+        return {}
+
+    # run aws configure export-credentials
+    try:
+        import json
+        result = subprocess.run(
+            ["aws", "configure", "export-credentials", "--profile", profile, "--format", "json"],
+            capture_output=True, text=True, check=False,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.strip() if result.stderr else "unknown error"
+            print(f"warning: failed to export credentials from profile {profile}: {stderr}", file=sys.stderr)
+            return {}
+
+        # parse JSON output
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError as e:
+            print(f"warning: failed to parse credentials JSON: {e}", file=sys.stderr)
+            return {}
+
+        creds: dict[str, str] = {}
+        if "AccessKeyId" in data:
+            creds["AWS_ACCESS_KEY_ID"] = data["AccessKeyId"]
+        if "SecretAccessKey" in data:
+            creds["AWS_SECRET_ACCESS_KEY"] = data["SecretAccessKey"]
+        if "SessionToken" in data:
+            creds["AWS_SESSION_TOKEN"] = data["SessionToken"]
+        return creds
+    except OSError as e:
+        print(f"warning: failed to run aws CLI: {e}", file=sys.stderr)
+        return {}
+
+
 def handle_update(image: str) -> int:
     """pull latest docker image."""
     print(f"pulling latest image: {image}", file=sys.stderr)
@@ -740,6 +796,11 @@ def main() -> int:
 
     # add bedrock env vars when using bedrock provider
     if provider == "bedrock":
+        # export credentials from AWS profile if profile is set and explicit creds are not
+        exported_creds = export_aws_profile_credentials()
+        for key, value in exported_creds.items():
+            # set in environment so build_bedrock_env_args() picks them up
+            os.environ[key] = value
         extra_env.extend(build_bedrock_env_args())
 
     # merge env var entries with CLI -v/--volume flags (env first, CLI appends)
@@ -2099,6 +2160,167 @@ def run_tests() -> None:
             provider = get_claude_provider(None)
             self.assertEqual(provider, "default")
 
+    class TestAwsCredentialExport(unittest.TestCase):
+        """tests for AWS profile credential export."""
+
+        def setUp(self) -> None:
+            """save environment."""
+            self._saved_env: dict[str, str | None] = {}
+            keys_to_clear = ["AWS_PROFILE", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"]
+            for key in keys_to_clear:
+                self._saved_env[key] = os.environ.get(key)
+                os.environ.pop(key, None)
+
+        def tearDown(self) -> None:
+            """restore environment."""
+            for key, val in self._saved_env.items():
+                if val is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = val
+
+        def test_exports_credentials_with_profile(self) -> None:
+            """AWS_PROFILE set → runs aws cli, parses JSON output."""
+            os.environ["AWS_PROFILE"] = "test-profile"
+            json_output = '{"AccessKeyId": "AKIATEST", "SecretAccessKey": "secret123", "SessionToken": "tok123"}'
+
+            def fake_run(cmd: list[str], **kwargs: object) -> unittest.mock.Mock:
+                mock_result = unittest.mock.Mock()
+                mock_result.returncode = 0
+                mock_result.stdout = json_output
+                mock_result.stderr = ""
+                return mock_result
+
+            with unittest.mock.patch("subprocess.run", side_effect=fake_run):
+                with unittest.mock.patch("shutil.which", return_value="/usr/bin/aws"):
+                    creds = export_aws_profile_credentials()
+
+            self.assertEqual(creds["AWS_ACCESS_KEY_ID"], "AKIATEST")
+            self.assertEqual(creds["AWS_SECRET_ACCESS_KEY"], "secret123")
+            self.assertEqual(creds["AWS_SESSION_TOKEN"], "tok123")
+
+        def test_skips_export_when_explicit_creds(self) -> None:
+            """AWS_ACCESS_KEY_ID set → no aws cli call."""
+            os.environ["AWS_PROFILE"] = "test-profile"
+            os.environ["AWS_ACCESS_KEY_ID"] = "AKIAEXPLICIT"
+
+            call_count = [0]
+
+            def fake_run(cmd: list[str], **kwargs: object) -> unittest.mock.Mock:
+                call_count[0] += 1
+                mock_result = unittest.mock.Mock()
+                mock_result.returncode = 0
+                mock_result.stdout = "{}"
+                return mock_result
+
+            with unittest.mock.patch("subprocess.run", side_effect=fake_run):
+                with unittest.mock.patch("shutil.which", return_value="/usr/bin/aws"):
+                    creds = export_aws_profile_credentials()
+
+            self.assertEqual(creds, {})
+            self.assertEqual(call_count[0], 0)
+
+        def test_skips_export_when_no_profile(self) -> None:
+            """AWS_PROFILE not set → no aws cli call."""
+            call_count = [0]
+
+            def fake_run(cmd: list[str], **kwargs: object) -> unittest.mock.Mock:
+                call_count[0] += 1
+                mock_result = unittest.mock.Mock()
+                mock_result.returncode = 0
+                mock_result.stdout = "{}"
+                return mock_result
+
+            with unittest.mock.patch("subprocess.run", side_effect=fake_run):
+                with unittest.mock.patch("shutil.which", return_value="/usr/bin/aws"):
+                    creds = export_aws_profile_credentials()
+
+            self.assertEqual(creds, {})
+            self.assertEqual(call_count[0], 0)
+
+        def test_handles_export_failure(self) -> None:
+            """aws cli fails → empty dict, no crash."""
+            os.environ["AWS_PROFILE"] = "test-profile"
+
+            def fake_run(cmd: list[str], **kwargs: object) -> unittest.mock.Mock:
+                mock_result = unittest.mock.Mock()
+                mock_result.returncode = 1
+                mock_result.stdout = ""
+                mock_result.stderr = "profile not found"
+                return mock_result
+
+            import io
+            captured = io.StringIO()
+            with unittest.mock.patch("sys.stderr", captured):
+                with unittest.mock.patch("subprocess.run", side_effect=fake_run):
+                    with unittest.mock.patch("shutil.which", return_value="/usr/bin/aws"):
+                        creds = export_aws_profile_credentials()
+
+            self.assertEqual(creds, {})
+            warning = captured.getvalue()
+            self.assertIn("warning:", warning)
+            self.assertIn("test-profile", warning)
+
+        def test_handles_missing_aws_cli(self) -> None:
+            """aws CLI not installed → empty dict, warning logged."""
+            os.environ["AWS_PROFILE"] = "test-profile"
+
+            import io
+            captured = io.StringIO()
+            with unittest.mock.patch("sys.stderr", captured):
+                with unittest.mock.patch("shutil.which", return_value=None):
+                    creds = export_aws_profile_credentials()
+
+            self.assertEqual(creds, {})
+            warning = captured.getvalue()
+            self.assertIn("warning:", warning)
+            self.assertIn("aws CLI not found", warning)
+
+        def test_parses_json_output(self) -> None:
+            """correctly extracts AccessKeyId/SecretAccessKey/SessionToken from JSON."""
+            os.environ["AWS_PROFILE"] = "test-profile"
+
+            # test with minimal output (no session token)
+            json_output = '{"AccessKeyId": "AKIA123", "SecretAccessKey": "secret456"}'
+
+            def fake_run(cmd: list[str], **kwargs: object) -> unittest.mock.Mock:
+                mock_result = unittest.mock.Mock()
+                mock_result.returncode = 0
+                mock_result.stdout = json_output
+                mock_result.stderr = ""
+                return mock_result
+
+            with unittest.mock.patch("subprocess.run", side_effect=fake_run):
+                with unittest.mock.patch("shutil.which", return_value="/usr/bin/aws"):
+                    creds = export_aws_profile_credentials()
+
+            self.assertEqual(creds["AWS_ACCESS_KEY_ID"], "AKIA123")
+            self.assertEqual(creds["AWS_SECRET_ACCESS_KEY"], "secret456")
+            self.assertNotIn("AWS_SESSION_TOKEN", creds)
+
+        def test_handles_invalid_json(self) -> None:
+            """invalid JSON output → empty dict, warning logged."""
+            os.environ["AWS_PROFILE"] = "test-profile"
+
+            def fake_run(cmd: list[str], **kwargs: object) -> unittest.mock.Mock:
+                mock_result = unittest.mock.Mock()
+                mock_result.returncode = 0
+                mock_result.stdout = "not valid json"
+                mock_result.stderr = ""
+                return mock_result
+
+            import io
+            captured = io.StringIO()
+            with unittest.mock.patch("sys.stderr", captured):
+                with unittest.mock.patch("subprocess.run", side_effect=fake_run):
+                    with unittest.mock.patch("shutil.which", return_value="/usr/bin/aws"):
+                        creds = export_aws_profile_credentials()
+
+            self.assertEqual(creds, {})
+            warning = captured.getvalue()
+            self.assertIn("warning:", warning)
+            self.assertIn("parse credentials JSON", warning)
+
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
     for tc in [TestResolvePath, TestSymlinkTargetDirs, TestShouldBindPort, TestBuildVolumes,
@@ -2108,7 +2330,7 @@ def run_tests() -> None:
                TestExtractCredentialsClaudeHome, TestSelinuxEnabled, TestSelinuxVolumeSuffix,
                TestClaudeConfigDirEnv, TestIsSensitiveName, TestBuildEnvVars,
                TestMergeEnvFlags, TestMergeVolumeFlags, TestBuildParser,
-               TestMainArgparse, TestHelpFlag, TestClaudeProvider]:
+               TestMainArgparse, TestHelpFlag, TestClaudeProvider, TestAwsCredentialExport]:
         suite.addTests(loader.loadTestsFromTestCase(tc))
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
