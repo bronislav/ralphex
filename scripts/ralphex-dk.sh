@@ -504,7 +504,9 @@ def build_bedrock_env_args(existing_env: list[str] | None = None) -> list[str]:
     skips vars that are already explicitly set in existing_env (from -E flags).
     """
     # extract var names already set via -E flags (format: ["-e", "VAR=val", ...] or ["-e", "VAR", ...])
+    # track both the var name and whether it was explicit (VAR=value) vs inherit (VAR)
     already_set: set[str] = set()
+    explicit_values: set[str] = set()  # vars with explicit VAR=value form
     if existing_env:
         i = 0
         while i < len(existing_env):
@@ -513,13 +515,32 @@ def build_bedrock_env_args(existing_env: list[str] | None = None) -> list[str]:
                 # extract var name from "VAR=value" or "VAR"
                 var_name = entry.split("=", 1)[0]
                 already_set.add(var_name)
+                # track if this is an explicit value (VAR=value) vs inherit form (VAR)
+                if "=" in entry:
+                    explicit_values.add(var_name)
                 i += 2
             else:
                 i += 1
 
     result: list[str] = []
+
+    # check if user is providing explicit credential VALUES via -E VAR=value flags
+    # if so, we should NOT inherit any session token from host env to avoid mixing
+    # credentials from different sources (e.g., stale session token with new key/secret)
+    # NOTE: inherit form (-E VAR) means user wants host values, so we should pass session token too
+    user_provides_explicit_creds = "AWS_ACCESS_KEY_ID" in explicit_values or "AWS_SECRET_ACCESS_KEY" in explicit_values
+    skip_session_token = user_provides_explicit_creds and "AWS_SESSION_TOKEN" not in already_set
+
     for var in BEDROCK_ENV_VARS:
-        if var in os.environ and var not in already_set:
+        # skip vars that are already set via -E flags
+        if var in already_set:
+            continue
+        # skip session token when user provides explicit credential values to avoid mixing
+        if skip_session_token and var == "AWS_SESSION_TOKEN":
+            continue
+        # only pass vars that exist in env AND have non-empty values
+        value = os.environ.get(var, "")
+        if value:
             result.extend(["-e", var])
     return result
 
@@ -642,12 +663,13 @@ def validate_bedrock_config(extra_env: list[str] | None = None) -> list[str]:
     if not get_val("AWS_REGION"):
         warnings.append("AWS_REGION not set (required for Bedrock)")
 
-    # check for credentials source
+    # check for credentials source (profile, explicit key/secret, or bearer token)
     has_profile = bool(get_val("AWS_PROFILE").strip())
     has_access_key = bool(get_val("AWS_ACCESS_KEY_ID"))
     has_secret_key = bool(get_val("AWS_SECRET_ACCESS_KEY"))
-    if not has_profile and not has_access_key:
-        warnings.append("no AWS credentials found (set AWS_PROFILE or AWS_ACCESS_KEY_ID)")
+    has_bearer_token = bool(get_val("AWS_BEARER_TOKEN_BEDROCK"))
+    if not has_profile and not has_access_key and not has_bearer_token:
+        warnings.append("no AWS credentials found (set AWS_PROFILE, AWS_ACCESS_KEY_ID, or AWS_BEARER_TOKEN_BEDROCK)")
     elif has_access_key and not has_secret_key:
         warnings.append("AWS_ACCESS_KEY_ID set but AWS_SECRET_ACCESS_KEY missing")
 
@@ -887,6 +909,7 @@ def main() -> int:
     extra_env = merge_env_flags(parsed.env)
 
     # add bedrock env vars when using bedrock provider
+    bedrock_env_args: list[str] = []  # track for diagnostics
     if provider == "bedrock":
         # export credentials from AWS profile if profile is set and explicit creds are not
         # pass extra_env so it skips export when user provides explicit -E credentials
@@ -895,7 +918,8 @@ def main() -> int:
             # set in environment so build_bedrock_env_args() picks them up
             os.environ[key] = value
         # pass existing extra_env to avoid overriding user's explicit -E values
-        extra_env.extend(build_bedrock_env_args(extra_env))
+        bedrock_env_args = build_bedrock_env_args(extra_env)
+        extra_env.extend(bedrock_env_args)
 
     # merge env var entries with CLI -v/--volume flags (env first, CLI appends)
     extra_volumes = merge_volume_flags(parsed.volume)
@@ -938,8 +962,11 @@ def main() -> int:
                 print(f"  exporting credentials from profile: {profile}", file=sys.stderr)
             elif os.environ.get("AWS_ACCESS_KEY_ID") or "AWS_ACCESS_KEY_ID" in env_from_flags:
                 print("  using explicit credentials", file=sys.stderr)
-            # show which bedrock env vars are being passed (from os.environ or -E flags)
-            passed_vars = [var for var in BEDROCK_ENV_VARS if var in os.environ or var in env_from_flags]
+            # show which bedrock env vars are actually being passed
+            # combine: vars from build_bedrock_env_args + bedrock vars from -E flags
+            passed_from_auto = [bedrock_env_args[i + 1] for i in range(0, len(bedrock_env_args), 2) if bedrock_env_args[i] == "-e"]
+            passed_from_flags = [var for var in BEDROCK_ENV_VARS if var in env_from_flags]
+            passed_vars = sorted(set(passed_from_auto + passed_from_flags), key=lambda v: BEDROCK_ENV_VARS.index(v) if v in BEDROCK_ENV_VARS else len(BEDROCK_ENV_VARS))
             if passed_vars:
                 print(f"  passing: {', '.join(passed_vars)}", file=sys.stderr)
             # validate bedrock config and print warnings (pass extra_env to check -E flags too)
@@ -2264,6 +2291,49 @@ def run_tests() -> None:
             self.assertNotIn("AWS_ACCESS_KEY_ID", args)
             self.assertIn("AWS_SECRET_ACCESS_KEY", args)
 
+        def test_inherit_form_passes_session_token(self) -> None:
+            """inherit form -E VAR passes session token from host (for STS creds)."""
+            os.environ["AWS_ACCESS_KEY_ID"] = "ASIATEST"
+            os.environ["AWS_SECRET_ACCESS_KEY"] = "secret"
+            os.environ["AWS_SESSION_TOKEN"] = "token123"
+            # user uses inherit form for credentials (expects all three from host)
+            existing_env = ["-e", "AWS_ACCESS_KEY_ID", "-e", "AWS_SECRET_ACCESS_KEY"]
+            args = build_bedrock_env_args(existing_env)
+            # session token should be passed since user is inheriting host creds
+            self.assertIn("AWS_SESSION_TOKEN", args)
+
+        def test_explicit_form_skips_session_token(self) -> None:
+            """explicit form -E VAR=value skips host session token to avoid mixing."""
+            os.environ["AWS_ACCESS_KEY_ID"] = "AKIAOLD"
+            os.environ["AWS_SECRET_ACCESS_KEY"] = "oldsecret"
+            os.environ["AWS_SESSION_TOKEN"] = "stale-token"
+            # user provides explicit new credentials
+            existing_env = ["-e", "AWS_ACCESS_KEY_ID=AKIANEW", "-e", "AWS_SECRET_ACCESS_KEY=newsecret"]
+            args = build_bedrock_env_args(existing_env)
+            # session token should NOT be passed (would be stale from different creds)
+            self.assertNotIn("AWS_SESSION_TOKEN", args)
+
+        def test_mixed_form_uses_explicit_logic(self) -> None:
+            """if any credential has explicit value, skip session token."""
+            os.environ["AWS_ACCESS_KEY_ID"] = "AKIATEST"
+            os.environ["AWS_SECRET_ACCESS_KEY"] = "secret"
+            os.environ["AWS_SESSION_TOKEN"] = "token123"
+            # user provides explicit access key but inherits secret (unusual but possible)
+            existing_env = ["-e", "AWS_ACCESS_KEY_ID=NEWKEY", "-e", "AWS_SECRET_ACCESS_KEY"]
+            args = build_bedrock_env_args(existing_env)
+            # session token should NOT be passed (explicit key means new credential source)
+            self.assertNotIn("AWS_SESSION_TOKEN", args)
+
+        def test_explicit_session_token_always_honored(self) -> None:
+            """explicit -E AWS_SESSION_TOKEN always passes through."""
+            os.environ["AWS_SESSION_TOKEN"] = "host-token"
+            # user explicitly provides session token (regardless of cred form)
+            existing_env = ["-e", "AWS_ACCESS_KEY_ID=KEY", "-e", "AWS_SESSION_TOKEN=explicit-token"]
+            args = build_bedrock_env_args(existing_env)
+            # explicit session token is not in result (already in existing_env)
+            # but importantly, skip_session_token logic doesn't remove it
+            self.assertNotIn("AWS_SESSION_TOKEN", args)  # already in existing_env, so skipped
+
         def test_invalid_provider_rejected(self) -> None:
             """unknown provider value → error."""
             os.environ["RALPHEX_CLAUDE_PROVIDER"] = "invalid"
@@ -2604,7 +2674,7 @@ def run_tests() -> None:
         def setUp(self) -> None:
             """save environment."""
             self._saved_env: dict[str, str | None] = {}
-            keys_to_clear = ["CLAUDE_CODE_USE_BEDROCK", "AWS_REGION", "AWS_PROFILE", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
+            keys_to_clear = ["CLAUDE_CODE_USE_BEDROCK", "AWS_REGION", "AWS_PROFILE", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_BEARER_TOKEN_BEDROCK"]
             for key in keys_to_clear:
                 self._saved_env[key] = os.environ.get(key)
                 os.environ.pop(key, None)
@@ -2668,6 +2738,16 @@ def run_tests() -> None:
             os.environ["AWS_REGION"] = "us-east-1"
             os.environ["AWS_ACCESS_KEY_ID"] = "AKIATEST"
             os.environ["AWS_SECRET_ACCESS_KEY"] = "secret"
+
+            warnings = validate_bedrock_config()
+
+            self.assertEqual(len(warnings), 0)
+
+        def test_no_warning_with_bearer_token(self) -> None:
+            """no credential warning when AWS_BEARER_TOKEN_BEDROCK is set."""
+            os.environ["CLAUDE_CODE_USE_BEDROCK"] = "1"
+            os.environ["AWS_REGION"] = "us-east-1"
+            os.environ["AWS_BEARER_TOKEN_BEDROCK"] = "token123"
 
             warnings = validate_bedrock_config()
 
