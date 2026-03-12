@@ -183,6 +183,27 @@ ralphex --review
 ralphex --review docs/plans/add-auth.md
 ```
 
+### Worktree Isolation
+
+The `--worktree` flag runs plan execution in an isolated git worktree at `.ralphex/worktrees/<branch>`, enabling parallel execution of multiple plans on the same repo without branch conflicts.
+
+**Supported modes:** `--worktree` only applies to full mode and `--tasks-only`. It is silently ignored for `--review`, `--external-only`, and `--plan` — these modes operate from the current directory.
+
+**Re-running reviews on a worktree branch:** if the task phase completed in a worktree but the review phase needs to be re-run, `cd` into the worktree directory and run the review from there:
+
+```bash
+# find the worktree
+ls .ralphex/worktrees/
+
+# run review from inside it
+cd .ralphex/worktrees/my-feature-branch
+ralphex --review
+# or
+ralphex --external-only
+```
+
+Worktrees are automatically removed on successful completion. If a run is interrupted, the worktree directory may remain and can be reused or removed manually.
+
 ### Plan Creation
 
 Plans can be created in several ways:
@@ -471,7 +492,7 @@ ralphex --external-only
 # tasks-only mode (run only task phase, skip all reviews)
 ralphex --tasks-only docs/plans/feature.md
 
-# run in isolated git worktree (parallel-safe)
+# run in isolated git worktree (full and tasks-only modes only)
 ralphex --worktree docs/plans/feature.md
 
 # override default branch for review diffs
@@ -514,7 +535,7 @@ ralphex --serve --port 3000 docs/plans/feature.md
 | `-b, --base-ref` | Override default branch for review diffs (branch name or commit hash) | auto-detect |
 | `--skip-finalize` | Skip finalize step even if enabled in config | false |
 | `--wait` | Wait duration before retrying on rate limit (e.g., `1h`, `30m`) | disabled |
-| `--worktree` | Run in isolated git worktree (enables parallel execution) | false |
+| `--worktree` | Run in isolated git worktree (full and tasks-only modes only) | false |
 | `--plan` | Create plan interactively (provide description) | - |
 | `-s, --serve` | Start web dashboard for real-time streaming | false |
 | `-p, --port` | Web dashboard port (used with `--serve`) | 8080 |
@@ -740,7 +761,7 @@ Use `--config-dir` or `RALPHEX_CONFIG_DIR` to override the global config locatio
 | `iteration_delay_ms` | Delay between iterations | `2000` |
 | `task_retry_count` | Task retry attempts | `1` |
 | `finalize_enabled` | Enable finalize step after reviews | `false` |
-| `use_worktree` | Run each plan in an isolated git worktree | `false` |
+| `use_worktree` | Run each plan in an isolated git worktree (full and tasks-only modes only) | `false` |
 | `plans_dir` | Plans directory | `docs/plans` |
 | `default_branch` | Override auto-detected default branch for review diffs | auto-detect |
 | `vcs_command` | VCS command for the git backend (set to a translation script for hg repos) | `git` |

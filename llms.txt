@@ -48,7 +48,7 @@ ralphex --codex-only
 # tasks-only mode (run only task phase, skip all reviews)
 ralphex --tasks-only docs/plans/feature.md
 
-# run in isolated git worktree (enables parallel execution)
+# run in isolated git worktree (full and tasks-only modes only; ignored for --review/--external-only)
 ralphex --worktree docs/plans/feature.md
 
 # override default branch for review diffs (useful for comparing against specific ref)
