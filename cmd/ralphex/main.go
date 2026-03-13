@@ -494,6 +494,17 @@ func executePlan(ctx context.Context, o opts, req executePlanRequest) error {
 		req.Colors.Info().Printf("\ncompleted in %s\n", elapsed)
 	}
 
+	// show paths for easy copy-paste after completion summary
+	if req.PlanFile != "" {
+		planFile := req.PlanFile
+		if req.MainPlanFile != "" {
+			planFile = req.MainPlanFile
+		}
+		completedPlanPath := filepath.Join(filepath.Dir(planFile), "completed", filepath.Base(planFile))
+		req.Colors.Info().Printf("  plan: %s\n", completedPlanPath)
+	}
+	req.Colors.Info().Printf("  progress: %s\n", baseLog.Path())
+
 	// keep web dashboard running after execution completes
 	if o.Serve {
 		closeLog()
