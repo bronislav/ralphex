@@ -43,6 +43,7 @@ e2e/                # playwright e2e tests for web dashboard
 scripts/            # utility scripts organized by function
 scripts/ralphex-dk/ # Docker wrapper script (Python) with tests
 scripts/codex-as-claude/ # codex wrapper for Claude-compatible output
+scripts/gemini-as-claude/ # gemini wrapper for Claude-compatible output
 scripts/hg2git/     # Mercurial-to-git translation script with tests
 scripts/opencode/   # opencode wrapper scripts with tests
 scripts/internal/   # internal dev/CI scripts (prep-toy-test, init-docker, etc.)
