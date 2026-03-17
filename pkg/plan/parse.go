@@ -148,7 +148,7 @@ func FileHasUncompletedCheckbox(path string) (bool, error) {
 	// scan lines for uncompleted checkboxes; only count actionable ones (text without [ ] or [x])
 	for line := range strings.SplitSeq(string(content), "\n") {
 		matches := checkboxPattern.FindStringSubmatch(line)
-		if matches == nil || len(matches) < 3 || matches[1] == "x" || matches[1] == "X" {
+		if len(matches) < 3 || matches[1] == "x" || matches[1] == "X" {
 			continue
 		}
 		text := strings.TrimSpace(matches[2])
