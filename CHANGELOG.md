@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.24.1 - 2026-03-17
+
+### Fixed
+
+- Fix wrapText continuation lines using reduced width instead of full terminal width
+
 ## v0.24.0 - 2026-03-17
 
 ### New Features
